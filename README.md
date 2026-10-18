@@ -6,7 +6,7 @@ The first notifier is Slack Incoming Webhooks. The internal notifier boundary is
 
 ## Status
 
-This project is under active development and has not published its first release yet.
+The latest release is [`v0.1.0`](https://github.com/Arata1202/workadventure-presence-notifier/releases/tag/v0.1.0). Multi-platform container images are available from `ghcr.io/arata1202/workadventure-presence-notifier` for Linux AMD64 and ARM64.
 
 ## Quick start
 
@@ -122,12 +122,12 @@ WORKADVENTURE_NETWORK=workadventure_default \
   docker compose -f compose.example.yaml up -d --build
 ```
 
-Release images are published to `ghcr.io/arata1202/workadventure-presence-notifier` for Linux AMD64 and ARM64. No image is available until the first release.
+Release images are published to `ghcr.io/arata1202/workadventure-presence-notifier` for Linux AMD64 and ARM64.
 
 After a release, pull a specific version instead of relying on `latest` for production deployments:
 
 ```sh
-docker pull ghcr.io/arata1202/workadventure-presence-notifier:1.0.0
+docker pull ghcr.io/arata1202/workadventure-presence-notifier:0.1.0
 ```
 
 ## One-shot mode
@@ -157,7 +157,7 @@ Normal daemon mode does not send a startup notification. The first notification 
 
 Requirements:
 
-- Go 1.25 or later
+- Go 1.27.2 or later
 - Docker, for container builds and protocol generation
 
 Run the same validation used by CI:
@@ -166,7 +166,9 @@ Run the same validation used by CI:
 test -z "$(gofmt -l .)"
 go vet ./...
 go test -race ./...
-docker build -t workadventure-presence-notifier:test .
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+docker build --build-arg VERSION=ci -t workadventure-presence-notifier:ci .
+test "$(docker run --rm workadventure-presence-notifier:ci --version)" = "ci"
 ```
 
 Regenerate the minimal gRPC compatibility types:
@@ -181,9 +183,9 @@ Build the binary:
 make build
 ```
 
-## Initial scope
+## v0.1.0 scope
 
-The first release does not include join or leave notifications, Slack Bot authentication, Block Kit messages, persistence, history, multiple WorkAdventure back instances, a management UI, health endpoints, or metrics.
+`v0.1.0` does not include join or leave notifications, Slack Bot authentication, Block Kit messages, persistence, history, multiple WorkAdventure back instances, a management UI, health endpoints, or metrics.
 
 ## Contributing and security
 

@@ -13,7 +13,7 @@ Contributions are welcome. Please keep changes focused, documented, and safe for
 
 Requirements:
 
-- Go 1.25 or later
+- Go 1.27.2 or later
 - Docker
 
 Clone the repository, then run:
@@ -49,7 +49,9 @@ Run the same checks used by CI:
 test -z "$(gofmt -l .)"
 go vet ./...
 go test -race ./...
-docker build -t workadventure-presence-notifier:test .
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+docker build --build-arg VERSION=ci -t workadventure-presence-notifier:ci .
+test "$(docker run --rm workadventure-presence-notifier:ci --version)" = "ci"
 ~~~
 
 For WorkAdventure protocol or provider changes, test against every version whose compatibility is claimed in the README.
