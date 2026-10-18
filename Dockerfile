@@ -1,5 +1,7 @@
-FROM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 
+ARG TARGETOS
+ARG TARGETARCH
 ARG VERSION=dev
 WORKDIR /src
 
@@ -7,13 +9,20 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/workadventure-presence-notifier \
     ./cmd/workadventure-presence-notifier
 
 FROM scratch
+
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="workadventure-presence-notifier" \
+      org.opencontainers.image.description="Periodically sends the current WorkAdventure user list to external notification services." \
+      org.opencontainers.image.source="https://github.com/Arata1202/workadventure-presence-notifier" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/workadventure-presence-notifier /workadventure-presence-notifier

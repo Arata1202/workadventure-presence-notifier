@@ -122,7 +122,13 @@ WORKADVENTURE_NETWORK=workadventure_default \
   docker compose -f compose.example.yaml up -d --build
 ```
 
-Tagged container images will be published after the first release.
+Release images are published to `ghcr.io/arata1202/workadventure-presence-notifier` for Linux AMD64 and ARM64. No image is available until the first release.
+
+After a release, pull a specific version instead of relying on `latest` for production deployments:
+
+```sh
+docker pull ghcr.io/arata1202/workadventure-presence-notifier:1.0.0
+```
 
 ## One-shot mode
 
@@ -181,7 +187,7 @@ The first release does not include join or leave notifications, Slack Bot authen
 
 ## Contributing and security
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull request guidelines.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull request guidelines. Maintainers should follow [RELEASING.md](RELEASING.md) when publishing a version.
 
 Do not report vulnerabilities in public issues. Follow [SECURITY.md](SECURITY.md) for private reporting guidance.
 
