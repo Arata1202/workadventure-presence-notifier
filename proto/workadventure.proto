@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/Arata1202/workadventure-presence-notifier/internal/proto/workadventure/v1;workadventurev1";
+
+service RoomManager {
+  rpc adminRoom(stream AdminPusherToBackMessage) returns (stream ServerToAdminClientMessage);
+  rpc getRooms(google.protobuf.Empty) returns (RoomsList);
+}
+
+message AdminPusherToBackMessage {
+  oneof message {
+    string subscribeToRoom = 1;
+  }
+}
+
+message UserJoinedRoomMessage {
+  string uuid = 1;
+  reserved 2;
+  string name = 3;
+}
+
+message UserLeftRoomMessage {
+  string uuid = 1;
+}
+
+message ServerToAdminClientMessage {
+  oneof message {
+    UserJoinedRoomMessage userJoinedRoom = 1;
+    UserLeftRoomMessage userLeftRoom = 2;
+  }
+}
+
+message RoomDescription {
+  string roomId = 1;
+  int32 nbUsers = 2;
+}
+
+message RoomsList {
+  repeated RoomDescription roomDescription = 1;
+}

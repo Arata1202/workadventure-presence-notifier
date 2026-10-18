@@ -1,0 +1,5 @@
+.git
+.gitignore
+config.yaml
+bin
+workadventure-presence-notifier

@@ -1,0 +1,19 @@
+services:
+  workadventure-presence-notifier:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL}"
+    volumes:
+      - ./config.yaml:/etc/workadventure-presence-notifier/config.yaml:ro
+    command:
+      - --config
+      - /etc/workadventure-presence-notifier/config.yaml
+    networks:
+      - workadventure
+
+networks:
+  workadventure:
+    external: true
+    name: "${WORKADVENTURE_NETWORK:-workadventure_default}"
