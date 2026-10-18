@@ -1,8 +1,18 @@
 # workadventure-presence-notifier
 
+[![CI](https://github.com/Arata1202/workadventure-presence-notifier/actions/workflows/ci.yml/badge.svg)](https://github.com/Arata1202/workadventure-presence-notifier/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/Arata1202/workadventure-presence-notifier)](https://github.com/Arata1202/workadventure-presence-notifier/releases/latest)
+[![License](https://img.shields.io/github/license/Arata1202/workadventure-presence-notifier)](LICENSE)
+
 A small service that periodically sends the current WorkAdventure user list to external notification services.
 
 The first notifier is Slack Incoming Webhooks. The internal notifier boundary is intentionally small so additional destinations can be contributed without changing the WorkAdventure presence provider.
+
+## Architecture
+
+![WorkAdventure presence notification architecture](docs/architecture/workadventure-presence-notifier.png)
+
+The notifier reads presence data through WorkAdventure's internal gRPC API and sends scheduled summaries to Slack over HTTPS. Port `50051` remains inside the trusted Docker network. The editable source is available in [Excalidraw format](docs/architecture/workadventure-presence-notifier.excalidraw).
 
 ## Status
 
@@ -41,6 +51,12 @@ Use `docker network ls` if the WorkAdventure network name is unknown. Never comm
 - Uses YAML for behavior and message templates
 - Keeps the Slack webhook URL in an environment variable
 - Does not retain or expose IP addresses
+
+Example Slack message:
+
+```text
+Currently online (3): Alice, Bob, Charlie
+```
 
 ## Compatibility
 

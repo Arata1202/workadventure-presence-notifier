@@ -40,6 +40,7 @@ Never commit webhook URLs, tokens, production configuration, room URLs, IP addre
 - Keep WorkAdventure compatibility protocol definitions minimal. Do not add fields that are not required by the notifier, especially IP address fields.
 - Regenerate protobuf code with `make generate` after editing `proto/workadventure.proto`.
 - Update the README and example configuration when user-facing behavior changes.
+- Update both `docs/architecture/workadventure-presence-notifier.excalidraw` and its exported PNG when the architecture diagram changes.
 
 ## Validation
 
