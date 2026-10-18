@@ -8,6 +8,29 @@ The first notifier is Slack Incoming Webhooks. The internal notifier boundary is
 
 This project is under active development and has not published its first release yet.
 
+## Quick start
+
+The notifier must be able to reach the WorkAdventure `back` service on its internal Docker network.
+
+```sh
+cp config.example.yaml config.yaml
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+export WORKADVENTURE_NETWORK="workadventure_default"
+
+docker compose -f compose.example.yaml run --rm --build \
+  workadventure-presence-notifier \
+  --config /etc/workadventure-presence-notifier/config.yaml \
+  --once
+```
+
+The command sends one real Slack notification and exits. If it succeeds, start daemon mode:
+
+```sh
+docker compose -f compose.example.yaml up -d --build
+```
+
+Use `docker network ls` if the WorkAdventure network name is unknown. Never commit the Slack webhook URL.
+
 ## Features
 
 - Discovers active WorkAdventure rooms through the internal gRPC API
@@ -21,7 +44,7 @@ This project is under active development and has not published its first release
 
 ## Compatibility
 
-The initial supported range is WorkAdventure `v1.33.0` and later. End-to-end container tests have been completed against WorkAdventure `v1.33.0` and `v1.34.2`.
+The minimum supported version is WorkAdventure `v1.33.0`. End-to-end container tests have been completed against WorkAdventure `v1.33.0` and `v1.34.2`. Later releases may work when the required internal RPCs remain compatible, but untested versions are not guaranteed.
 
 The provider uses the `getRooms` and `adminRoom` RPCs shared by WorkAdventure `v1.33.x` and `v1.34.x`. The compatibility protocol intentionally defines only the fields required for presence notifications. The IP address field sent by WorkAdventure is not part of the generated Go type and is discarded while decoding.
 
@@ -34,6 +57,10 @@ Copy the example configuration:
 ```sh
 cp config.example.yaml config.yaml
 ```
+
+Configuration files use Go duration syntax such as `30s`, `5m`, and `1h`. Unknown YAML keys are rejected to catch configuration mistakes. The example file documents every currently supported setting.
+
+`workadventure.address` must point to the internal gRPC endpoint of the WorkAdventure `back` service. The default is `back:50051`.
 
 Set the Slack Incoming Webhook URL through the environment:
 
@@ -77,7 +104,7 @@ Build the image:
 docker build -t workadventure-presence-notifier:dev .
 ```
 
-Run the container on the same Docker network as the WorkAdventure `back` service:
+Run the container on the same Docker network as the WorkAdventure `back` service. The gRPC connection is unencrypted and is intended only for a trusted internal network; do not expose port `50051` publicly:
 
 ```sh
 docker run --rm \
@@ -88,7 +115,7 @@ docker run --rm \
   --config /etc/workadventure-presence-notifier/config.yaml
 ```
 
-The repository also includes `compose.example.yaml`. Set `WORKADVENTURE_NETWORK` when the WorkAdventure Docker network uses a different name:
+The repository also includes `compose.example.yaml`. The container runs as the non-root UID/GID `65532:65532`, so the bind-mounted configuration file must be readable by that user. Set `WORKADVENTURE_NETWORK` when the WorkAdventure Docker network uses a different name:
 
 ```sh
 WORKADVENTURE_NETWORK=workadventure_default \
@@ -99,7 +126,7 @@ Tagged container images will be published after the first release.
 
 ## One-shot mode
 
-One-shot mode waits for the initial WorkAdventure presence snapshot, sends one notification, and exits:
+One-shot mode waits for the initial WorkAdventure presence snapshot, sends one real notification, and exits with a non-zero status if configuration, presence collection, or delivery fails:
 
 ```sh
 docker run --rm \
@@ -127,10 +154,13 @@ Requirements:
 - Go 1.25 or later
 - Docker, for container builds and protocol generation
 
-Run tests:
+Run the same validation used by CI:
 
 ```sh
-go test ./...
+test -z "$(gofmt -l .)"
+go vet ./...
+go test -race ./...
+docker build -t workadventure-presence-notifier:test .
 ```
 
 Regenerate the minimal gRPC compatibility types:
@@ -148,3 +178,7 @@ make build
 ## Initial scope
 
 The first release does not include join or leave notifications, Slack Bot authentication, Block Kit messages, persistence, history, multiple WorkAdventure back instances, a management UI, health endpoints, or metrics.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
