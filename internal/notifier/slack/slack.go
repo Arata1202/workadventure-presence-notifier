@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -70,13 +71,16 @@ func (n *Notifier) Notify(ctx context.Context, snapshot presence.Snapshot) error
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, n.webhookURL, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("create Slack webhook request: %w", err)
+		return errors.New("create Slack webhook request: invalid webhook URL")
 	}
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := n.client.Do(request)
 	if err != nil {
-		return fmt.Errorf("send Slack webhook: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("send Slack webhook: %w", ctxErr)
+		}
+		return errors.New("send Slack webhook: request failed")
 	}
 	defer response.Body.Close()
 

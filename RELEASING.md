@@ -7,9 +7,13 @@ Releases are created from immutable semantic-version tags and publish multi-plat
 Before creating a release:
 
 - Make the repository public. The release workflow intentionally fails while it is private.
+- Protect `main` with a branch ruleset that requires the CI workflow before merging.
+- Add a tag ruleset for `v*` that blocks tag updates and deletion and restricts tag creation to maintainers.
+- Enable immutable releases in the repository settings.
 - Confirm that the latest `main` CI run succeeds.
 - Complete an integration test against the intended WorkAdventure deployment.
 - Review merged changes and choose the next semantic version.
+- Enable dependency graph, Dependabot alerts, secret scanning, and push protection after the repository becomes public.
 - Confirm that private vulnerability reporting is enabled after the repository becomes public.
 
 ## Create a release

@@ -3,8 +3,11 @@ package slack
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
@@ -91,5 +94,36 @@ func TestNotifyReturnsHTTPError(t *testing.T) {
 	}
 	if err := notifier.Notify(context.Background(), presence.Snapshot{}); err == nil {
 		t.Fatal("Notify() error = nil")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+func TestNotifyDoesNotExposeWebhookURLOnTransportError(t *testing.T) {
+	const webhookURL = "https://hooks.slack.com/services/secret/path/value"
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: request.Method, URL: request.URL.String(), Err: errors.New("connection failed")}
+	})}
+
+	notifier, err := New(Config{
+		WebhookURL:    webhookURL,
+		Message:       "{{ .Users }}",
+		EmptyMessage:  "empty",
+		UserSeparator: ", ",
+	}, client)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	err = notifier.Notify(context.Background(), presence.Snapshot{})
+	if err == nil {
+		t.Fatal("Notify() error = nil")
+	}
+	if strings.Contains(err.Error(), webhookURL) || strings.Contains(err.Error(), "secret/path/value") {
+		t.Fatalf("Notify() error exposed webhook URL: %v", err)
 	}
 }

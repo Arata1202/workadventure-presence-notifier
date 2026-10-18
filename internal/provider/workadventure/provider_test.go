@@ -106,3 +106,16 @@ func TestProviderCollectsPresence(t *testing.T) {
 		t.Fatal("Run() did not stop")
 	}
 }
+
+func TestReconcileWorkersUpdatesExpectedUsers(t *testing.T) {
+	provider := New(Options{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	worker := &roomWorker{cancel: func() {}}
+	worker.expectedUsers.Store(1)
+	provider.workers["room-a"] = worker
+
+	provider.reconcileWorkers(context.Background(), nil, map[string]int{"room-a": 3})
+
+	if got := worker.expectedUsers.Load(); got != 3 {
+		t.Fatalf("expectedUsers = %d, want 3", got)
+	}
+}

@@ -32,5 +32,11 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
       - name: Build container
-        run: docker build -t workadventure-presence-notifier:ci .
+        run: docker build --build-arg VERSION=ci -t workadventure-presence-notifier:ci .
+
+      - name: Verify container version
+        run: test "$(docker run --rm workadventure-presence-notifier:ci --version)" = "ci"

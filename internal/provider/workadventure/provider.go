@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
@@ -25,13 +26,18 @@ type Options struct {
 	DialOptions           []grpc.DialOption
 }
 
+type roomWorker struct {
+	cancel        context.CancelFunc
+	expectedUsers atomic.Int64
+}
+
 type Provider struct {
 	options Options
 	logger  *slog.Logger
 	store   *store
 
 	mu      sync.Mutex
-	workers map[string]context.CancelFunc
+	workers map[string]*roomWorker
 }
 
 func New(options Options, logger *slog.Logger) *Provider {
@@ -39,7 +45,7 @@ func New(options Options, logger *slog.Logger) *Provider {
 		options: options,
 		logger:  logger,
 		store:   newStore(),
-		workers: make(map[string]context.CancelFunc),
+		workers: make(map[string]*roomWorker),
 	}
 }
 
@@ -113,11 +119,12 @@ func (p *Provider) reconcileWorkers(ctx context.Context, client pb.RoomManagerCl
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for roomID, cancel := range p.workers {
-		if _, ok := active[roomID]; ok {
+	for roomID, worker := range p.workers {
+		if expectedUsers, ok := active[roomID]; ok {
+			worker.expectedUsers.Store(int64(expectedUsers))
 			continue
 		}
-		cancel()
+		worker.cancel()
 		delete(p.workers, roomID)
 	}
 
@@ -126,21 +133,23 @@ func (p *Provider) reconcileWorkers(ctx context.Context, client pb.RoomManagerCl
 			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
-		p.workers[roomID] = cancel
-		go p.runRoom(workerCtx, client, roomID, expectedUsers)
+		worker := &roomWorker{cancel: cancel}
+		worker.expectedUsers.Store(int64(expectedUsers))
+		p.workers[roomID] = worker
+		go p.runRoom(workerCtx, client, roomID, &worker.expectedUsers)
 	}
 }
 
 func (p *Provider) stopWorkers() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for roomID, cancel := range p.workers {
-		cancel()
+	for roomID, worker := range p.workers {
+		worker.cancel()
 		delete(p.workers, roomID)
 	}
 }
 
-func (p *Provider) runRoom(ctx context.Context, client pb.RoomManagerClient, roomID string, expectedUsers int) {
+func (p *Provider) runRoom(ctx context.Context, client pb.RoomManagerClient, roomID string, expectedUsers *atomic.Int64) {
 	for {
 		p.store.resetRoom(roomID)
 		err := p.subscribeRoom(ctx, client, roomID, expectedUsers)
@@ -159,7 +168,7 @@ type receiveResult struct {
 	err     error
 }
 
-func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClient, roomID string, expectedUsers int) error {
+func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClient, roomID string, expectedUsers *atomic.Int64) error {
 	stream, err := client.AdminRoom(ctx)
 	if err != nil {
 		return fmt.Errorf("open adminRoom stream: %w", err)
@@ -189,7 +198,7 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 
 	timer := time.NewTimer(p.options.InitialSyncTimeout)
 	defer timer.Stop()
-	ready := expectedUsers <= 0
+	ready := expectedUsers.Load() <= 0
 	if ready {
 		p.store.setRoomReady(roomID)
 	}
@@ -215,7 +224,7 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 			case *pb.ServerToAdminClientMessage_UserJoinedRoom:
 				joinedEvents++
 				p.store.addUser(roomID, event.UserJoinedRoom.GetUuid(), event.UserJoinedRoom.GetName())
-				if !ready && joinedEvents >= expectedUsers {
+				if !ready && int64(joinedEvents) >= expectedUsers.Load() {
 					ready = true
 					p.store.setRoomReady(roomID)
 				}
