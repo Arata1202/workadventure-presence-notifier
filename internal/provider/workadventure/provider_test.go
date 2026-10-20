@@ -2,6 +2,7 @@ package workadventure
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -18,6 +19,27 @@ const testBufferSize = 1024 * 1024
 
 type fakeRoomManager struct {
 	pb.UnimplementedRoomManagerServer
+}
+
+type zeroCountRoomManager struct {
+	pb.UnimplementedRoomManagerServer
+}
+
+func (zeroCountRoomManager) GetRooms(context.Context, *emptypb.Empty) (*pb.RoomsList, error) {
+	return &pb.RoomsList{RoomDescription: []*pb.RoomDescription{{RoomId: "room-a", NbUsers: 0}}}, nil
+}
+
+func (zeroCountRoomManager) AdminRoom(stream grpc.BidiStreamingServer[pb.AdminPusherToBackMessage, pb.ServerToAdminClientMessage]) error {
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	if err := stream.Send(&pb.ServerToAdminClientMessage{Message: &pb.ServerToAdminClientMessage_UserJoinedRoom{
+		UserJoinedRoom: &pb.UserJoinedRoomMessage{Uuid: "racing-user", Name: "Alice"},
+	}}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return nil
 }
 
 func (fakeRoomManager) GetRooms(context.Context, *emptypb.Empty) (*pb.RoomsList, error) {
@@ -117,5 +139,47 @@ func TestReconcileWorkersUpdatesExpectedUsers(t *testing.T) {
 
 	if got := worker.expectedUsers.Load(); got != 3 {
 		t.Fatalf("expectedUsers = %d, want 3", got)
+	}
+}
+
+func TestZeroExpectedUsersWaitsForInitialSyncTimeout(t *testing.T) {
+	listener := bufconn.Listen(testBufferSize)
+	server := grpc.NewServer()
+	pb.RegisterRoomManagerServer(server, zeroCountRoomManager{})
+	go func() { _ = server.Serve(listener) }()
+	defer server.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	provider := New(Options{
+		Address:               "passthrough:///bufnet",
+		RoomDiscoveryInterval: time.Hour,
+		ReconnectInterval:     time.Second,
+		InitialSyncTimeout:    100 * time.Millisecond,
+		RequestTimeout:        time.Second,
+		DialOptions: []grpc.DialOption{grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		})},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	done := make(chan error, 1)
+	go func() { done <- provider.Run(ctx) }()
+
+	earlyCtx, earlyCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer earlyCancel()
+	if err := provider.WaitReady(earlyCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitReady() before sync timeout = %v", err)
+	}
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), time.Second)
+	defer readyCancel()
+	if err := provider.WaitReady(readyCtx); err != nil {
+		t.Fatalf("WaitReady() after sync timeout = %v", err)
+	}
+	snapshot, err := provider.Snapshot()
+	if err != nil || snapshot.Count() != 1 {
+		t.Fatalf("Snapshot() = %#v, %v", snapshot, err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

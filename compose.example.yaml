@@ -4,14 +4,18 @@ services:
       context: .
     restart: unless-stopped
     environment:
-      SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL}"
+      SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
     volumes:
       - ./config.yaml:/etc/workadventure-presence-notifier/config.yaml:ro
+      - notifier-state:/var/lib/workadventure-presence-notifier
     command:
       - --config
       - /etc/workadventure-presence-notifier/config.yaml
     networks:
       - workadventure
+
+volumes:
+  notifier-state:
 
 networks:
   workadventure:

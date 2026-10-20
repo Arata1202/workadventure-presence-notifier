@@ -5,113 +5,174 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/Arata1202/workadventure-presence-notifier/internal/config"
-	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
+	"github.com/Arata1202/workadventure-presence-notifier/internal/coordinator"
 	slacknotifier "github.com/Arata1202/workadventure-presence-notifier/internal/notifier/slack"
 	workadventureprovider "github.com/Arata1202/workadventure-presence-notifier/internal/provider/workadventure"
-	"github.com/Arata1202/workadventure-presence-notifier/internal/scheduler"
+	"github.com/Arata1202/workadventure-presence-notifier/internal/status"
 )
 
 var version = "dev"
 
 func main() {
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
 		slog.Error("application stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
-	once := flag.Bool("once", false, "send one notification and exit")
-	showVersion := flag.Bool("version", false, "print the version and exit")
-	flag.Parse()
-
+func run(root context.Context, args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("workadventure-presence-notifier", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "config.yaml", "path to the YAML configuration file")
+	once := flags.Bool("once", false, "reconcile the Slack status once and exit")
+	showVersion := flags.Bool("version", false, "print the version and exit")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 	if *showVersion {
-		fmt.Println(version)
-		return nil
+		_, err := fmt.Fprintln(output, version)
+		return err
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
-
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
 	}
 
-	presenceProvider := workadventureprovider.New(workadventureprovider.Options{
+	source := workadventureprovider.New(workadventureprovider.Options{
 		Address:               cfg.WorkAdventure.Address,
 		RoomDiscoveryInterval: cfg.WorkAdventure.RoomDiscoveryInterval,
 		ReconnectInterval:     cfg.WorkAdventure.ReconnectInterval,
 		InitialSyncTimeout:    cfg.WorkAdventure.InitialSyncTimeout,
 		RequestTimeout:        cfg.WorkAdventure.RequestTimeout,
 	}, logger)
-
-	slack, err := slacknotifier.New(slacknotifier.Config{
-		WebhookURL:    cfg.Slack.WebhookURL,
+	destination, err := slacknotifier.New(slacknotifier.Config{
+		BotToken:      cfg.Slack.BotToken,
+		ChannelID:     cfg.Slack.ChannelID,
 		Message:       cfg.Slack.Message,
-		EmptyMessage:  cfg.Slack.EmptyMessage,
 		UserSeparator: cfg.Slack.UserSeparator,
-	}, nil)
+		MaxAttempts:   slacknotifier.DefaultAttempts,
+		MaxRetryWait:  slacknotifier.MaximumRetryWait,
+	}, &http.Client{Timeout: cfg.Slack.RequestTimeout})
 	if err != nil {
 		return err
 	}
-
-	notificationScheduler := scheduler.New(
-		cfg.Notification.Interval,
-		presenceProvider,
-		[]notifier.Notifier{slack},
-		logger,
+	reconciler, err := status.NewReconciler(destination, status.NewFileStore(cfg.Status.StateFile))
+	if err != nil {
+		return err
+	}
+	changeCoordinator := coordinator.New(
+		cfg.Status.Debounce, cfg.Status.ReconciliationInterval, source, reconciler, logger,
 	)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
+	ctx, cancel := context.WithCancel(root)
+	defer cancel()
 	providerErrors := make(chan error, 1)
-	go func() { providerErrors <- presenceProvider.Run(ctx) }()
+	go func() { providerErrors <- source.Run(ctx) }()
 
 	if *once {
-		waitTimeout := cfg.WorkAdventure.RequestTimeout + cfg.WorkAdventure.RoomDiscoveryInterval + cfg.WorkAdventure.InitialSyncTimeout + cfg.WorkAdventure.ReconnectInterval
-		waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
-		defer cancel()
-		if err := presenceProvider.WaitReady(waitCtx); err != nil {
-			return fmt.Errorf("wait for WorkAdventure presence: %w", err)
-		}
-		if err := notificationScheduler.NotifyOnce(ctx); err != nil {
+		waitCtx, waitCancel := context.WithTimeout(ctx, workAdventureReadinessTimeout(cfg))
+		if err := changeCoordinator.WaitReady(waitCtx); err != nil {
+			waitCancel()
 			return err
 		}
-		logger.Info("presence notification sent")
-		stop()
-		return waitForProvider(providerErrors, time.Second)
+		waitCancel()
+		reconcileCtx, reconcileCancel := context.WithTimeout(ctx, slackReconciliationTimeout(cfg))
+		reconcileErr := changeCoordinator.ReconcileReady(reconcileCtx)
+		reconcileCancel()
+		if reconcileErr == nil {
+			logger.Info("presence status reconciled")
+		}
+		cancel()
+		return errors.Join(reconcileErr, waitForStop(providerErrors, cfg.Status.ShutdownTimeout))
 	}
 
-	logger.Info("presence notifier started", "interval", cfg.Notification.Interval)
-	schedulerErrors := make(chan error, 1)
-	go func() { schedulerErrors <- notificationScheduler.Run(ctx) }()
+	logger.Info("presence status notifier started")
+	coordinatorErrors := make(chan error, 1)
+	go func() { coordinatorErrors <- changeCoordinator.Run(ctx) }()
 
+	var runErr error
+	coordinatorStopped := false
 	select {
-	case <-ctx.Done():
-		return nil
+	case <-root.Done():
 	case err := <-providerErrors:
-		if err == nil || errors.Is(err, context.Canceled) {
-			return nil
+		if err != nil && !errors.Is(err, context.Canceled) {
+			runErr = err
 		}
-		return err
-	case err := <-schedulerErrors:
-		return err
+	case err := <-coordinatorErrors:
+		coordinatorStopped = true
+		if err != nil && !errors.Is(err, context.Canceled) {
+			runErr = err
+		}
+	}
+	cancel()
+	if !coordinatorStopped {
+		err, stopped := waitForCoordinatorStop(coordinatorErrors, cfg.Status.ShutdownTimeout)
+		if !stopped {
+			logger.Error("coordinator did not stop before shutdown cleanup")
+			return errors.Join(runErr, errors.New("coordinator did not stop before shutdown cleanup"))
+		}
+		if err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+			runErr = err
+		}
+	}
+	intentionalShutdown := shutdownWasIntentional(root)
+	cleanupStatus(intentionalShutdown, cfg.Status.ShutdownTimeout, reconciler, logger)
+	return runErr
+}
+
+type statusCleaner interface {
+	DeleteAll(context.Context) error
+}
+
+func cleanupStatus(intentionalShutdown bool, timeout time.Duration, cleaner statusCleaner, logger *slog.Logger) {
+	if !intentionalShutdown {
+		return
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
+	defer shutdownCancel()
+	if err := cleaner.DeleteAll(shutdownCtx); err != nil {
+		logger.Error("failed to remove Slack status during shutdown", "error", err)
 	}
 }
 
-func waitForProvider(providerErrors <-chan error, timeout time.Duration) error {
+func workAdventureReadinessTimeout(cfg config.Config) time.Duration {
+	return 2*cfg.WorkAdventure.RequestTimeout + cfg.WorkAdventure.RoomDiscoveryInterval +
+		cfg.WorkAdventure.InitialSyncTimeout + cfg.WorkAdventure.ReconnectInterval
+}
+
+func slackReconciliationTimeout(cfg config.Config) time.Duration {
+	return slacknotifier.DefaultAttempts*cfg.Slack.RequestTimeout +
+		time.Duration(slacknotifier.DefaultAttempts-1)*slacknotifier.MaximumRetryWait
+}
+
+func shutdownWasIntentional(root context.Context) bool { return root.Err() != nil }
+
+func waitForCoordinatorStop(errorsChannel <-chan error, timeout time.Duration) (error, bool) {
 	select {
-	case err := <-providerErrors:
+	case err := <-errorsChannel:
+		return err, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
+func waitForStop(errorsChannel <-chan error, timeout time.Duration) error {
+	select {
+	case err := <-errorsChannel:
 		if err == nil || errors.Is(err, context.Canceled) {
 			return nil
 		}

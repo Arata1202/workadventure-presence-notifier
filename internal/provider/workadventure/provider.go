@@ -88,6 +88,10 @@ func (p *Provider) Snapshot() (presence.Snapshot, error) {
 	return p.store.snapshot()
 }
 
+func (p *Provider) Changes() <-chan struct{} {
+	return p.store.changes()
+}
+
 func (p *Provider) discover(ctx context.Context, client pb.RoomManagerClient) {
 	requestCtx, cancel := context.WithTimeout(ctx, p.options.RequestTimeout)
 	defer cancel()
@@ -198,10 +202,8 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 
 	timer := time.NewTimer(p.options.InitialSyncTimeout)
 	defer timer.Stop()
-	ready := expectedUsers.Load() <= 0
-	if ready {
-		p.store.setRoomReady(roomID)
-	}
+	waitForTimeout := expectedUsers.Load() <= 0
+	ready := false
 	joinedEvents := 0
 
 	for {
@@ -224,7 +226,7 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 			case *pb.ServerToAdminClientMessage_UserJoinedRoom:
 				joinedEvents++
 				p.store.addUser(roomID, event.UserJoinedRoom.GetUuid(), event.UserJoinedRoom.GetName())
-				if !ready && int64(joinedEvents) >= expectedUsers.Load() {
+				if !ready && !waitForTimeout && int64(joinedEvents) >= expectedUsers.Load() {
 					ready = true
 					p.store.setRoomReady(roomID)
 				}

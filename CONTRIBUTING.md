@@ -23,19 +23,19 @@ go mod download
 go test ./...
 ~~~
 
-The Slack webhook URL must remain outside configuration files:
+The Slack bot token must remain outside configuration files:
 
 ~~~sh
-export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+export SLACK_BOT_TOKEN="xoxb-..."
 ~~~
 
-Never commit webhook URLs, tokens, production configuration, room URLs, IP addresses, or real user presence data.
+Never commit tokens, production configuration, room URLs, IP addresses, or real user presence data.
 
 ## Making changes
 
 - Run `gofmt` on Go files.
 - Add or update tests for behavior changes.
-- Keep provider and notifier implementations behind their existing interfaces.
+- Keep presence, coordination, state persistence, and Slack transport boundaries focused.
 - Preserve UUID-based user deduplication and avoid logging personal presence data.
 - Keep WorkAdventure compatibility protocol definitions minimal. Do not add fields that are not required by the notifier, especially IP address fields.
 - Regenerate protobuf code with `make generate` after editing `proto/workadventure.proto`.

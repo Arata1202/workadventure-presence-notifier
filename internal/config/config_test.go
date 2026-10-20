@@ -8,26 +8,26 @@ import (
 )
 
 func TestLoad(t *testing.T) {
-	t.Setenv(SlackWebhookEnv, "https://hooks.slack.test/example")
+	t.Setenv(SlackBotTokenEnv, "xoxb-test-token")
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := []byte(`workadventure:
   address: "workadventure-back:50051"
   room_discovery_interval: "15s"
-  reconnect_interval: "3s"
-  initial_sync_timeout: "1s"
-  request_timeout: "4s"
-notification:
-  interval: "20m"
+status:
+  debounce: "2s"
+  reconciliation_interval: "20m"
+  shutdown_timeout: "4s"
+  state_file: "/data/status.json"
 notifiers:
   slack:
+    request_timeout: "7s"
+    channel_id: "C012345"
     message: "Online: {{ .Users }}"
-    empty_message: "Nobody is online."
     user_separator: " | "
 `)
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -38,16 +38,16 @@ notifiers:
 	if cfg.WorkAdventure.RoomDiscoveryInterval != 15*time.Second {
 		t.Fatalf("RoomDiscoveryInterval = %v", cfg.WorkAdventure.RoomDiscoveryInterval)
 	}
-	if cfg.Notification.Interval != 20*time.Minute {
-		t.Fatalf("Interval = %v", cfg.Notification.Interval)
+	if cfg.Status.Debounce != 2*time.Second || cfg.Status.ReconciliationInterval != 20*time.Minute {
+		t.Fatalf("Status = %#v", cfg.Status)
 	}
-	if cfg.Slack.WebhookURL != "https://hooks.slack.test/example" {
-		t.Fatal("WebhookURL was not loaded from the environment")
+	if cfg.Slack.BotToken != "xoxb-test-token" || cfg.Slack.ChannelID != "C012345" || cfg.Slack.RequestTimeout != 7*time.Second {
+		t.Fatalf("Slack = %#v", cfg.Slack)
 	}
 }
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
-	t.Setenv(SlackWebhookEnv, "https://hooks.slack.test/example")
+	t.Setenv(SlackBotTokenEnv, "token")
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("unknown: true\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -57,13 +57,19 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-func TestLoadRequiresSlackWebhook(t *testing.T) {
-	t.Setenv(SlackWebhookEnv, "")
+func TestLoadRequiresSlackConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("notifiers:\n  slack:\n    channel_id: C123\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want missing token error")
+	}
+	t.Setenv(SlackBotTokenEnv, "token")
 	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err == nil {
-		t.Fatal("Load() error = nil, want missing webhook error")
+		t.Fatal("Load() error = nil, want missing channel error")
 	}
 }
