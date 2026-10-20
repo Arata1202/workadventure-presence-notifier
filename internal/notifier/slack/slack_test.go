@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
 )
 
@@ -80,7 +81,7 @@ func TestAPIOkFalseAndMessageNotFound(t *testing.T) {
 	if _, err := client.Post(context.Background(), "hello", "id"); err == nil || !strings.Contains(err.Error(), "not_in_channel") {
 		t.Fatalf("Post() error = %v", err)
 	}
-	if err := client.Delete(context.Background(), "123"); !errors.Is(err, ErrMessageNotFound) {
+	if err := client.Delete(context.Background(), "123"); !errors.Is(err, notifier.ErrMessageNotFound) {
 		t.Fatalf("Delete() error = %v", err)
 	}
 }
@@ -176,11 +177,11 @@ func TestFindByOperationPaginatesAndFiltersMetadata(t *testing.T) {
 	}))
 	defer server.Close()
 	client := newTestClient(t, server, Config{})
-	matches, err := client.FindByOperation(context.Background(), "op", "100.000000")
+	matches, err := client.FindByOperation(context.Background(), "op", time.Unix(100, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 1 || matches[0].Timestamp != "102" || requests != 2 {
+	if len(matches) != 1 || matches[0] != "102" || requests != 2 {
 		t.Fatalf("matches = %#v, requests = %d", matches, requests)
 	}
 }
@@ -210,11 +211,11 @@ func TestFindByOperationDecodesHistoryResponseLargerThan64KiB(t *testing.T) {
 	}))
 	defer server.Close()
 	client := newTestClient(t, server, Config{})
-	matches, err := client.FindByOperation(context.Background(), "op", "100.000000")
+	matches, err := client.FindByOperation(context.Background(), "op", time.Unix(100, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 1 || matches[0].Timestamp != "102.000000" {
+	if len(matches) != 1 || matches[0] != "102.000000" {
 		t.Fatalf("matches = %#v", matches)
 	}
 }
@@ -225,7 +226,7 @@ func TestSlackResponsesRemainBounded(t *testing.T) {
 	}))
 	defer server.Close()
 	client := newTestClient(t, server, Config{MaxAttempts: 1})
-	if _, err := client.FindByOperation(context.Background(), "op", "100.000000"); err == nil || !strings.Contains(err.Error(), "exceeded") {
+	if _, err := client.FindByOperation(context.Background(), "op", time.Unix(100, 0)); err == nil || !strings.Contains(err.Error(), "exceeded") {
 		t.Fatalf("FindByOperation() error = %v", err)
 	}
 }

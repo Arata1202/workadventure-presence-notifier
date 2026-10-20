@@ -4,7 +4,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/Arata1202/workadventure-presence-notifier)](https://github.com/Arata1202/workadventure-presence-notifier/releases/latest)
 [![License](https://img.shields.io/github/license/Arata1202/workadventure-presence-notifier)](LICENSE)
 
-Maintains one current WorkAdventure presence message in one Slack channel.
+Maintains one current WorkAdventure presence message in a configured destination. Version 0.2 ships with a Slack destination.
 
 Version 0.2 is an event-driven redesign. It uses a Slack bot, replaces the message after debounced presence changes, and removes it when nobody is present. The periodic Incoming Webhook implementation remains available as [v0.1.0](https://github.com/Arata1202/workadventure-presence-notifier/releases/tag/v0.1.0).
 
@@ -22,13 +22,13 @@ Version 0.2 is an event-driven redesign. It uses a Slack bot, replaces the messa
 - Disables Slack link and media unfurls
 - Does not retain or log display names, room URLs, IP addresses, tokens, or Slack response bodies
 
-The process intentionally supports one Slack channel and one service instance per state file.
+The process intentionally supports one configured destination and one service instance per state file.
 
 ## Architecture
 
 ![WorkAdventure presence notification architecture](docs/architecture/workadventure-presence-notifier.png)
 
-The notifier reads `getRooms` and `adminRoom` from WorkAdventure over internal, unencrypted gRPC. Keep `back:50051` on a trusted private network. After a synchronized presence change, the coordinator debounces the snapshot and reconciles it with Slack through `chat.postMessage`, `chat.update`, `chat.delete`, and `conversations.history`. The editable diagram source is available in [Excalidraw format](docs/architecture/workadventure-presence-notifier.excalidraw).
+The notifier reads `getRooms` and `adminRoom` from WorkAdventure over internal, unencrypted gRPC. Keep `back:50051` on a trusted private network. After a synchronized presence change, the platform-neutral coordinator sends the snapshot to a platform-neutral status reconciler. The configured destination adapter owns rendering, message references, recovery lookup, and API errors. The included Slack adapter implements those operations through `chat.postMessage`, `chat.update`, `chat.delete`, and `conversations.history`. Adding another built-in adapter does not change the presence provider, coordinator, or reconciler. The editable diagram source is available in [Excalidraw format](docs/architecture/workadventure-presence-notifier.excalidraw).
 
 For a non-empty update, the service atomically records a random operation ID before any Slack call, marks the operation attempted, and attaches only that operation ID as Slack message metadata. If the post result is ambiguous, the next reconciliation searches channel history from five minutes before the local attempt time to tolerate clock skew. A no-match result cannot trigger a replacement during the 30-second recovery grace period. The newest matching message is unconditionally updated to the current rendered text and becomes current; duplicate matches and the previous current message become stale, and stale messages are deleted. A crash or failed deletion leaves enough non-sensitive state for recovery or cleanup to be retried. On a SIGINT or SIGTERM shutdown, deletion starts only after the coordinator has stopped and is attempted within `status.shutdown_timeout`; state is cleared only after successful deletion or Slack `message_not_found`.
 
@@ -112,7 +112,9 @@ The administrator-authored template is trusted and may contain static Slack link
 
 The state parent directory is created with private permissions when possible. State is written as a mode-0600 temporary file, synced, closed, atomically renamed, and followed by a directory sync.
 
-The file contains Slack channel and message identifiers, a pending operation UUID, and a non-sensitive attempt timestamp when recovery is needed. Rendered-content hashes are process-local and are not persisted. The file contains no display names, rendered text, room data, or tokens. The design assumes a single running instance. Do not share one state file between replicas or channels.
+The version 1 file uses a destination-neutral schema containing a destination ID, opaque current and stale message references, a pending operation UUID, and a non-sensitive RFC 3339 attempt time when recovery is needed. Rendered-content hashes are process-local and are not persisted. The file contains no display names, rendered text, room data, or tokens. The design assumes a single running instance. Do not share one state file between replicas or destinations.
+
+Unknown fields, malformed identifiers, impossible invariants, and unsupported versions stop startup instead of discarding cleanup information.
 
 ## Docker
 

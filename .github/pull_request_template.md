@@ -18,5 +18,5 @@
 - [ ] I ran the applicable formatting, vet, test, vulnerability, and container checks described in `CONTRIBUTING.md`.
 - [ ] I regenerated protobuf code if I changed `proto/workadventure.proto`.
 - [ ] I documented any WorkAdventure compatibility or configuration impact above.
-- [ ] I reviewed logs and errors for tokens, Slack identifiers, IP addresses, room URLs, user names, and other sensitive data.
+- [ ] I reviewed logs and errors for tokens, destination identifiers, IP addresses, room URLs, user names, and other sensitive data.
 - [ ] I did not commit secrets, production configuration, or real user presence data.

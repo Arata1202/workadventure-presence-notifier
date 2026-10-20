@@ -1,29 +1,36 @@
 package status
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 )
 
-const stateVersion = 1
+const (
+	stateVersion            = 1
+	maximumIdentifierLength = 1024
+)
 
 type State struct {
-	Version   int      `json:"version"`
-	ChannelID string   `json:"channel_id,omitempty"`
-	MessageTS string   `json:"message_ts,omitempty"`
-	Stale     []string `json:"stale_message_timestamps,omitempty"`
-	Pending   *Pending `json:"pending_post,omitempty"`
+	Version       int                   `json:"version"`
+	DestinationID string                `json:"destination_id,omitempty"`
+	Current       notifier.MessageRef   `json:"current_message_ref,omitempty"`
+	Stale         []notifier.MessageRef `json:"stale_message_refs,omitempty"`
+	Pending       *Pending              `json:"pending_post,omitempty"`
 }
 
 type Pending struct {
-	OperationID string `json:"operation_id"`
-	AttemptedAt string `json:"attempted_at,omitempty"`
+	OperationID string     `json:"operation_id"`
+	AttemptedAt *time.Time `json:"attempted_at,omitempty"`
 }
 
 type FileStore struct{ path string }
@@ -38,12 +45,18 @@ func (s *FileStore) Load() (State, error) {
 	if err != nil {
 		return State{}, fmt.Errorf("read status state: %w", err)
 	}
-	var state State
-	if err := json.Unmarshal(data, &state); err != nil {
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
 		return State{}, fmt.Errorf("decode status state: %w", err)
 	}
-	if state.Version != stateVersion {
-		return State{}, fmt.Errorf("unsupported status state version %d", state.Version)
+	if header.Version != stateVersion {
+		return State{}, fmt.Errorf("unsupported status state version %d", header.Version)
+	}
+	var state State
+	if err := decodeStrictJSON(data, &state); err != nil {
+		return State{}, fmt.Errorf("decode status state: %w", err)
 	}
 	if err := validateState(state); err != nil {
 		return State{}, fmt.Errorf("validate status state: %w", err)
@@ -52,6 +65,9 @@ func (s *FileStore) Load() (State, error) {
 }
 
 func (s *FileStore) Save(state State) error {
+	if state.Version != 0 && state.Version != stateVersion {
+		return fmt.Errorf("unsupported status state version %d", state.Version)
+	}
 	state.Version = stateVersion
 	if err := validateState(state); err != nil {
 		return fmt.Errorf("validate status state: %w", err)
@@ -75,8 +91,7 @@ func (s *FileStore) Save(state State) error {
 	if err := temporary.Chmod(0o600); err != nil {
 		return fmt.Errorf("set temporary status state permissions: %w", err)
 	}
-	encoder := json.NewEncoder(temporary)
-	if err := encoder.Encode(state); err != nil {
+	if err := json.NewEncoder(temporary).Encode(state); err != nil {
 		return fmt.Errorf("encode status state: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
@@ -101,53 +116,69 @@ func (s *FileStore) Save(state State) error {
 }
 
 func validateState(state State) error {
-	tracked := state.MessageTS != "" || len(state.Stale) > 0 || state.Pending != nil
-	if tracked && state.ChannelID == "" {
-		return errors.New("tracked Slack state requires a channel ID")
+	if state.Version != stateVersion {
+		return fmt.Errorf("unsupported status state version %d", state.Version)
 	}
-	if state.MessageTS != "" {
-		if _, err := parseSlackTimestamp(state.MessageTS); err != nil {
-			return fmt.Errorf("invalid current message timestamp: %w", err)
+	tracked := state.Current != "" || len(state.Stale) > 0 || state.Pending != nil
+	if tracked && state.DestinationID == "" {
+		return errors.New("tracked state requires a destination ID")
+	}
+	if state.DestinationID != "" {
+		if err := validateIdentifier("destination ID", state.DestinationID); err != nil {
+			return err
 		}
 	}
-	seen := make(map[string]struct{}, len(state.Stale)+1)
-	if state.MessageTS != "" {
-		seen[state.MessageTS] = struct{}{}
+	seen := make(map[notifier.MessageRef]struct{}, len(state.Stale)+1)
+	if state.Current != "" {
+		if err := validateIdentifier("current message reference", string(state.Current)); err != nil {
+			return err
+		}
+		seen[state.Current] = struct{}{}
 	}
-	for _, timestamp := range state.Stale {
-		if _, err := parseSlackTimestamp(timestamp); err != nil {
-			return fmt.Errorf("invalid stale message timestamp: %w", err)
+	for _, ref := range state.Stale {
+		if err := validateIdentifier("stale message reference", string(ref)); err != nil {
+			return err
 		}
-		if _, exists := seen[timestamp]; exists {
-			return fmt.Errorf("duplicate tracked message timestamp %q", timestamp)
+		if _, exists := seen[ref]; exists {
+			return fmt.Errorf("duplicate tracked message reference %q", ref)
 		}
-		seen[timestamp] = struct{}{}
+		seen[ref] = struct{}{}
 	}
 	if state.Pending != nil {
-		if state.Pending.OperationID == "" {
-			return errors.New("pending Slack post requires an operation ID")
+		if err := validateIdentifier("pending operation ID", state.Pending.OperationID); err != nil {
+			return err
 		}
-		if state.Pending.AttemptedAt != "" {
-			if _, err := parseSlackTimestamp(state.Pending.AttemptedAt); err != nil {
-				return fmt.Errorf("invalid pending attempt timestamp: %w", err)
-			}
+		if state.Pending.AttemptedAt != nil && state.Pending.AttemptedAt.IsZero() {
+			return errors.New("pending attempt time must not be zero")
 		}
 	}
 	return nil
 }
 
-func parseSlackTimestamp(value string) (time.Time, error) {
-	secondsText, microsText, found := strings.Cut(value, ".")
-	if !found || secondsText == "" || len(microsText) != 6 {
-		return time.Time{}, errors.New("expected seconds and six fractional digits")
+func validateIdentifier(name, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", name)
 	}
-	seconds, err := strconv.ParseInt(secondsText, 10, 64)
-	if err != nil || seconds < 0 {
-		return time.Time{}, errors.New("invalid seconds")
+	if len(value) > maximumIdentifierLength {
+		return fmt.Errorf("%s exceeds %d bytes", name, maximumIdentifierLength)
 	}
-	micros, err := strconv.ParseInt(microsText, 10, 64)
-	if err != nil || micros < 0 {
-		return time.Time{}, errors.New("invalid fractional seconds")
+	if !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s is invalid", name)
 	}
-	return time.Unix(seconds, micros*int64(time.Microsecond)), nil
+	return nil
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }

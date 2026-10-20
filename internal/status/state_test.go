@@ -6,15 +6,19 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 )
 
 func TestFileStoreRoundTripUsesPrivateAtomicFile(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "nested", "state.json")
 	store := NewFileStore(path)
+	attemptedAt := time.Unix(100, 123).UTC()
 	want := State{
-		ChannelID: "C123", MessageTS: "123.456000", Stale: []string{"122.000000"},
-		Pending: &Pending{OperationID: "11111111-2222-4333-8444-555555555555", AttemptedAt: "100.000000"},
+		DestinationID: "slack:C123", Current: "123.456000", Stale: []notifier.MessageRef{"122.000000"},
+		Pending: &Pending{OperationID: "11111111-2222-4333-8444-555555555555", AttemptedAt: &attemptedAt},
 	}
 	if err := store.Save(want); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -58,10 +62,10 @@ func TestFileStoreMissingAndInvalidState(t *testing.T) {
 	}
 }
 
-func TestFileStoreDoesNotPersistLegacyContentHashes(t *testing.T) {
+func TestFileStoreDoesNotPersistRenderedContentHashes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	store := NewFileStore(path)
-	if err := store.Save(State{ChannelID: "C123", MessageTS: "123.456000"}); err != nil {
+	if err := store.Save(State{DestinationID: "slack:C123", Current: "123.456000"}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -69,17 +73,23 @@ func TestFileStoreDoesNotPersistLegacyContentHashes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), "content_hash") {
-		t.Fatalf("state contains legacy content hash field: %s", data)
+		t.Fatalf("state contains rendered content hash field: %s", data)
 	}
 }
 
-func TestFileStoreLoadRejectsImpossibleState(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{"version":1,"message_ts":"123.000000"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := NewFileStore(path).Load(); err == nil {
-		t.Fatal("Load() error = nil for tracked state without a channel")
+func TestFileStoreLoadRejectsUnknownFieldsIncompatibleVersionsAndInvalidState(t *testing.T) {
+	for _, content := range []string{
+		`{"version":1,"unexpected":true}`,
+		`{"version":99,"destination_id":"slack:C123","current_message_ref":"123.000000"}`,
+		`{"version":1,"current_message_ref":"123.000000"}`,
+	} {
+		path := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewFileStore(path).Load(); err == nil {
+			t.Fatalf("Load() error = nil for %s", content)
+		}
 	}
 }
 
@@ -88,13 +98,14 @@ func TestFileStoreRejectsInvalidStateInvariants(t *testing.T) {
 		name  string
 		state State
 	}{
-		{name: "missing channel", state: State{MessageTS: "123.000000"}},
-		{name: "invalid current timestamp", state: State{ChannelID: "C1", MessageTS: "invalid"}},
-		{name: "invalid stale timestamp", state: State{ChannelID: "C1", Stale: []string{"invalid"}}},
-		{name: "duplicate current and stale", state: State{ChannelID: "C1", MessageTS: "123.000000", Stale: []string{"123.000000"}}},
-		{name: "duplicate stale", state: State{ChannelID: "C1", Stale: []string{"123.000000", "123.000000"}}},
-		{name: "pending without operation", state: State{ChannelID: "C1", Pending: &Pending{}}},
-		{name: "invalid attempt timestamp", state: State{ChannelID: "C1", Pending: &Pending{OperationID: "op", AttemptedAt: "invalid"}}},
+		{name: "missing destination", state: State{Current: "123.000000"}},
+		{name: "invalid destination", state: State{DestinationID: " slack:C1", Current: "123.000000"}},
+		{name: "invalid current reference", state: State{DestinationID: "slack:C1", Current: " invalid"}},
+		{name: "empty stale reference", state: State{DestinationID: "slack:C1", Stale: []notifier.MessageRef{""}}},
+		{name: "duplicate current and stale", state: State{DestinationID: "slack:C1", Current: "123.000000", Stale: []notifier.MessageRef{"123.000000"}}},
+		{name: "duplicate stale", state: State{DestinationID: "slack:C1", Stale: []notifier.MessageRef{"123.000000", "123.000000"}}},
+		{name: "pending without operation", state: State{DestinationID: "slack:C1", Pending: &Pending{}}},
+		{name: "zero attempt time", state: State{DestinationID: "slack:C1", Pending: &Pending{OperationID: "op", AttemptedAt: &time.Time{}}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

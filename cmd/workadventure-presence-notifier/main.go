@@ -15,6 +15,7 @@ import (
 
 	"github.com/Arata1202/workadventure-presence-notifier/internal/config"
 	"github.com/Arata1202/workadventure-presence-notifier/internal/coordinator"
+	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 	slacknotifier "github.com/Arata1202/workadventure-presence-notifier/internal/notifier/slack"
 	workadventureprovider "github.com/Arata1202/workadventure-presence-notifier/internal/provider/workadventure"
 	"github.com/Arata1202/workadventure-presence-notifier/internal/status"
@@ -35,7 +36,7 @@ func run(root context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("workadventure-presence-notifier", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "config.yaml", "path to the YAML configuration file")
-	once := flags.Bool("once", false, "reconcile the Slack status once and exit")
+	once := flags.Bool("once", false, "reconcile the destination status once and exit")
 	showVersion := flags.Bool("version", false, "print the version and exit")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -59,18 +60,11 @@ func run(root context.Context, args []string, output io.Writer) error {
 		InitialSyncTimeout:    cfg.WorkAdventure.InitialSyncTimeout,
 		RequestTimeout:        cfg.WorkAdventure.RequestTimeout,
 	}, logger)
-	destination, err := slacknotifier.New(slacknotifier.Config{
-		BotToken:      cfg.Slack.BotToken,
-		ChannelID:     cfg.Slack.ChannelID,
-		Message:       cfg.Slack.Message,
-		UserSeparator: cfg.Slack.UserSeparator,
-		MaxAttempts:   slacknotifier.DefaultAttempts,
-		MaxRetryWait:  slacknotifier.MaximumRetryWait,
-	}, &http.Client{Timeout: cfg.Slack.RequestTimeout})
+	destination, err := newDestination(cfg.Destination)
 	if err != nil {
 		return err
 	}
-	reconciler, err := status.NewReconciler(destination, status.NewFileStore(cfg.Status.StateFile))
+	reconciler, err := status.NewReconciler(destination.client, status.NewFileStore(cfg.Status.StateFile))
 	if err != nil {
 		return err
 	}
@@ -90,7 +84,7 @@ func run(root context.Context, args []string, output io.Writer) error {
 			return err
 		}
 		waitCancel()
-		reconcileCtx, reconcileCancel := context.WithTimeout(ctx, slackReconciliationTimeout(cfg))
+		reconcileCtx, reconcileCancel := context.WithTimeout(ctx, destination.reconciliationTimeout)
 		reconcileErr := changeCoordinator.ReconcileReady(reconcileCtx)
 		reconcileCancel()
 		if reconcileErr == nil {
@@ -145,7 +139,7 @@ func cleanupStatus(intentionalShutdown bool, timeout time.Duration, cleaner stat
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
 	defer shutdownCancel()
 	if err := cleaner.DeleteAll(shutdownCtx); err != nil {
-		logger.Error("failed to remove Slack status during shutdown", "error", err)
+		logger.Error("failed to remove destination status during shutdown", "error", err)
 	}
 }
 
@@ -154,9 +148,30 @@ func workAdventureReadinessTimeout(cfg config.Config) time.Duration {
 		cfg.WorkAdventure.InitialSyncTimeout + cfg.WorkAdventure.ReconnectInterval
 }
 
-func slackReconciliationTimeout(cfg config.Config) time.Duration {
-	return slacknotifier.DefaultAttempts*cfg.Slack.RequestTimeout +
-		time.Duration(slacknotifier.DefaultAttempts-1)*slacknotifier.MaximumRetryWait
+type configuredDestination struct {
+	client                notifier.Destination
+	reconciliationTimeout time.Duration
+}
+
+func newDestination(cfg config.DestinationConfig) (configuredDestination, error) {
+	switch cfg.Type {
+	case "slack":
+		client, err := slacknotifier.New(slacknotifier.Config{
+			BotToken:      cfg.Slack.BotToken,
+			ChannelID:     cfg.Slack.ChannelID,
+			Message:       cfg.Slack.Message,
+			UserSeparator: cfg.Slack.UserSeparator,
+			MaxAttempts:   slacknotifier.DefaultAttempts,
+			MaxRetryWait:  slacknotifier.MaximumRetryWait,
+		}, &http.Client{Timeout: cfg.Slack.RequestTimeout})
+		return configuredDestination{
+			client: client,
+			reconciliationTimeout: slacknotifier.DefaultAttempts*cfg.Slack.RequestTimeout +
+				time.Duration(slacknotifier.DefaultAttempts-1)*slacknotifier.MaximumRetryWait,
+		}, err
+	default:
+		return configuredDestination{}, fmt.Errorf("unsupported destination %q", cfg.Type)
+	}
 }
 
 func shutdownWasIntentional(root context.Context) bool { return root.Err() != nil }

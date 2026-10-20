@@ -7,21 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
-	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier/slack"
+	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
 )
-
-type Slack interface {
-	ChannelID() string
-	Render(presence.Snapshot) (string, error)
-	Post(context.Context, string, string) (string, error)
-	Update(context.Context, string, string, string) error
-	Delete(context.Context, string) error
-	FindByOperation(context.Context, string, string) ([]slack.Message, error)
-}
 
 type StateStore interface {
 	Load() (State, error)
@@ -33,7 +23,7 @@ const (
 	DefaultRecoveryGracePeriod  = 30 * time.Second
 )
 
-var ErrPendingRecoveryGrace = errors.New("pending Slack post is still within the recovery grace period")
+var ErrPendingRecoveryGrace = errors.New("pending destination post is still within the recovery grace period")
 
 type Options struct {
 	Now                  func() time.Time
@@ -42,7 +32,7 @@ type Options struct {
 }
 
 type Reconciler struct {
-	slack                Slack
+	destination          notifier.Destination
 	store                StateStore
 	state                State
 	renderedHash         string
@@ -52,7 +42,7 @@ type Reconciler struct {
 	recoveryGracePeriod  time.Duration
 }
 
-func NewReconciler(destination Slack, store StateStore, supplied ...Options) (*Reconciler, error) {
+func NewReconciler(destination notifier.Destination, store StateStore, supplied ...Options) (*Reconciler, error) {
 	if len(supplied) > 1 {
 		return nil, errors.New("only one reconciler options value is supported")
 	}
@@ -85,11 +75,11 @@ func NewReconciler(destination Slack, store StateStore, supplied ...Options) (*R
 	if err := validateState(state); err != nil {
 		return nil, fmt.Errorf("validate persisted status state: %w", err)
 	}
-	if state.ChannelID != "" && state.ChannelID != destination.ChannelID() {
-		return nil, errors.New("persisted Slack channel does not match configured channel")
+	if state.DestinationID != "" && state.DestinationID != destination.ID() {
+		return nil, errors.New("persisted destination does not match configured destination")
 	}
 	return &Reconciler{
-		slack: destination, store: store, state: state, now: options.Now,
+		destination: destination, store: store, state: state, now: options.Now,
 		recoverySafetyWindow: options.RecoverySafetyWindow,
 		recoveryGracePeriod:  options.RecoveryGracePeriod,
 	}, nil
@@ -99,7 +89,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, 
 	if snapshot.Count() == 0 {
 		return r.reconcileEmpty(ctx)
 	}
-	text, err := r.slack.Render(snapshot)
+	text, err := r.destination.Render(snapshot)
 	if err != nil {
 		return err
 	}
@@ -110,22 +100,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, 
 		}
 		return nil
 	}
-	if !force && r.state.MessageTS != "" && r.hasRenderedHash && r.renderedHash == hash {
+	if !force && r.state.Current != "" && r.hasRenderedHash && r.renderedHash == hash {
 		return r.deleteStale(ctx)
 	}
 	operationID, err := newUUID()
 	if err != nil {
-		return fmt.Errorf("generate Slack operation ID: %w", err)
+		return fmt.Errorf("generate destination operation ID: %w", err)
 	}
 	updated := cloneState(r.state)
-	updated.ChannelID = r.slack.ChannelID()
+	updated.DestinationID = r.destination.ID()
 	updated.Pending = &Pending{OperationID: operationID}
 	if err := r.store.Save(updated); err != nil {
 		persisted, loadErr := r.store.Load()
 		if loadErr == nil {
 			r.state = persisted
 		}
-		return errors.Join(fmt.Errorf("persist pending Slack post: %w", err), loadErr)
+		return errors.Join(fmt.Errorf("persist pending destination post: %w", err), loadErr)
 	}
 	r.state = updated
 	return r.recoverPending(ctx, text, hash)
@@ -136,10 +126,10 @@ func (r *Reconciler) recoverPending(ctx context.Context, text, currentHash strin
 	if pending == nil {
 		return nil
 	}
-	if pending.AttemptedAt != "" {
+	if pending.AttemptedAt != nil {
 		matches, err := r.findPending(ctx, pending)
 		if err != nil {
-			return fmt.Errorf("find pending Slack status: %w", err)
+			return fmt.Errorf("find pending destination status: %w", err)
 		}
 		if len(matches) > 0 {
 			return r.acceptMatches(ctx, matches, text, currentHash)
@@ -148,33 +138,33 @@ func (r *Reconciler) recoverPending(ctx context.Context, text, currentHash strin
 			return err
 		}
 		updated := cloneState(r.state)
-		updated.Pending.AttemptedAt = ""
-		if err := r.save(updated, "persist cleared Slack post attempt"); err != nil {
+		updated.Pending.AttemptedAt = nil
+		if err := r.save(updated, "persist cleared destination post attempt"); err != nil {
 			return err
 		}
 	}
 	updated := cloneState(r.state)
-	updated.Pending.AttemptedAt = slackTimestamp(r.now())
-	if err := r.save(updated, "persist attempted Slack post"); err != nil {
+	attemptedAt := r.now().UTC()
+	updated.Pending.AttemptedAt = &attemptedAt
+	if err := r.save(updated, "persist attempted destination post"); err != nil {
 		return err
 	}
 	pending = r.state.Pending
-	newTimestamp, err := r.slack.Post(ctx, text, pending.OperationID)
+	newRef, err := r.destination.Post(ctx, text, pending.OperationID)
 	if err != nil {
 		return err
 	}
-	return r.finalizePending(ctx, newTimestamp, nil, currentHash)
+	return r.finalizePending(ctx, newRef, nil, currentHash)
 }
 
-func (r *Reconciler) acceptMatches(ctx context.Context, matches []slack.Message, text, currentHash string) error {
-	sort.Slice(matches, func(i, j int) bool { return matches[i].Timestamp > matches[j].Timestamp })
-	current := matches[0].Timestamp
-	stale := make([]string, 0, len(matches)-1)
+func (r *Reconciler) acceptMatches(ctx context.Context, matches []notifier.MessageRef, text, currentHash string) error {
+	current := matches[0]
+	stale := make([]notifier.MessageRef, 0, len(matches)-1)
 	for _, match := range matches[1:] {
-		stale = appendUnique(stale, match.Timestamp)
+		stale = appendUnique(stale, match)
 	}
-	err := r.slack.Update(ctx, current, text, r.state.Pending.OperationID)
-	if errors.Is(err, slack.ErrMessageNotFound) {
+	err := r.destination.Update(ctx, current, text, r.state.Pending.OperationID)
+	if errors.Is(err, notifier.ErrMessageNotFound) {
 		return r.recoverAfterMissingUpdate(ctx, current, text, currentHash)
 	}
 	if err != nil {
@@ -183,64 +173,64 @@ func (r *Reconciler) acceptMatches(ctx context.Context, matches []slack.Message,
 	return r.finalizePending(ctx, current, stale, currentHash)
 }
 
-func (r *Reconciler) recoverAfterMissingUpdate(ctx context.Context, missingTimestamp, text, currentHash string) error {
+func (r *Reconciler) recoverAfterMissingUpdate(ctx context.Context, missingRef notifier.MessageRef, text, currentHash string) error {
 	pending := r.state.Pending
 	matches, err := r.findPending(ctx, pending)
 	if err != nil {
-		return fmt.Errorf("recheck pending Slack status: %w", err)
+		return fmt.Errorf("recheck pending destination status: %w", err)
 	}
 	filtered := matches[:0]
 	for _, match := range matches {
-		if match.Timestamp != missingTimestamp {
+		if match != missingRef {
 			filtered = append(filtered, match)
 		}
 	}
 	updated := cloneState(r.state)
-	updated.Stale = appendUnique(updated.Stale, missingTimestamp)
+	updated.Stale = appendUnique(updated.Stale, missingRef)
 	if len(filtered) > 0 {
-		if err := r.save(updated, "persist missing Slack post recovery"); err != nil {
+		if err := r.save(updated, "persist missing destination post recovery"); err != nil {
 			return err
 		}
 		return r.acceptMatches(ctx, filtered, text, currentHash)
 	}
-	if err := r.save(updated, "persist missing Slack post recovery"); err != nil {
+	if err := r.save(updated, "persist missing destination post recovery"); err != nil {
 		return err
 	}
 	if err := r.requireRecoveryGraceElapsed(pending.AttemptedAt); err != nil {
 		return err
 	}
 	updated = cloneState(r.state)
-	updated.Pending.AttemptedAt = ""
-	if err := r.save(updated, "persist cleared missing Slack post attempt"); err != nil {
+	updated.Pending.AttemptedAt = nil
+	if err := r.save(updated, "persist cleared missing destination post attempt"); err != nil {
 		return err
 	}
 	return r.recoverPending(ctx, text, currentHash)
 }
 
-func (r *Reconciler) finalizePending(ctx context.Context, newTimestamp string, stale []string, currentHash string) error {
+func (r *Reconciler) finalizePending(ctx context.Context, newRef notifier.MessageRef, stale []notifier.MessageRef, currentHash string) error {
 	previous := r.state
 	updated := cloneState(previous)
-	updated.ChannelID = r.slack.ChannelID()
-	updated.MessageTS = newTimestamp
+	updated.DestinationID = r.destination.ID()
+	updated.Current = newRef
 	updated.Pending = nil
-	for _, timestamp := range stale {
-		updated.Stale = appendUnique(updated.Stale, timestamp)
+	for _, ref := range stale {
+		updated.Stale = appendUnique(updated.Stale, ref)
 	}
-	if previous.MessageTS != "" && previous.MessageTS != newTimestamp {
-		updated.Stale = appendUnique(updated.Stale, previous.MessageTS)
+	if previous.Current != "" && previous.Current != newRef {
+		updated.Stale = appendUnique(updated.Stale, previous.Current)
 	}
 	if err := validateState(updated); err != nil {
-		return fmt.Errorf("validate new Slack status: %w", err)
+		return fmt.Errorf("validate new destination status: %w", err)
 	}
 	if err := r.store.Save(updated); err != nil {
 		persisted, loadErr := r.store.Load()
-		if loadErr == nil && persisted.Pending == nil && persisted.MessageTS == newTimestamp {
+		if loadErr == nil && persisted.Pending == nil && persisted.Current == newRef {
 			r.state = persisted
 			r.renderedHash = currentHash
 			r.hasRenderedHash = true
-			return errors.Join(fmt.Errorf("confirm durable new Slack status: %w", err), r.deleteStale(ctx))
+			return errors.Join(fmt.Errorf("confirm durable new destination status: %w", err), r.deleteStale(ctx))
 		}
-		return errors.Join(fmt.Errorf("persist new Slack status: %w", err), loadErr)
+		return errors.Join(fmt.Errorf("persist new destination status: %w", err), loadErr)
 	}
 	r.state = updated
 	r.renderedHash = currentHash
@@ -258,20 +248,20 @@ func (r *Reconciler) reconcileEmpty(ctx context.Context) error {
 	if pending == nil {
 		return nil
 	}
-	if pending.AttemptedAt == "" {
+	if pending.AttemptedAt == nil {
 		updated := cloneState(r.state)
 		updated.Pending = nil
-		if updated.MessageTS == "" && len(updated.Stale) == 0 {
-			updated.ChannelID = ""
+		if updated.Current == "" && len(updated.Stale) == 0 {
+			updated.DestinationID = ""
 		}
-		return r.save(updated, "persist canceled Slack post")
+		return r.save(updated, "persist canceled destination post")
 	}
 	matches, err := r.findPending(ctx, pending)
 	if err != nil {
-		return fmt.Errorf("find pending Slack status for deletion: %w", err)
+		return fmt.Errorf("find pending destination status for deletion: %w", err)
 	}
 	for _, match := range matches {
-		if err := r.slack.Delete(ctx, match.Timestamp); err != nil && !errors.Is(err, slack.ErrMessageNotFound) {
+		if err := r.destination.Delete(ctx, match); err != nil && !errors.Is(err, notifier.ErrMessageNotFound) {
 			return err
 		}
 	}
@@ -282,20 +272,20 @@ func (r *Reconciler) reconcileEmpty(ctx context.Context) error {
 	}
 	updated := cloneState(r.state)
 	updated.Pending = nil
-	if updated.MessageTS == "" && len(updated.Stale) == 0 {
-		updated.ChannelID = ""
+	if updated.Current == "" && len(updated.Stale) == 0 {
+		updated.DestinationID = ""
 	}
-	return r.save(updated, "persist deleted pending Slack status")
+	return r.save(updated, "persist deleted pending destination status")
 }
 
 func (r *Reconciler) deleteAll(ctx context.Context) error {
-	var timestamps []string
-	if r.state.MessageTS != "" {
-		timestamps = append(timestamps, r.state.MessageTS)
+	var refs []notifier.MessageRef
+	if r.state.Current != "" {
+		refs = append(refs, r.state.Current)
 	}
-	timestamps = append(timestamps, r.state.Stale...)
-	for _, timestamp := range timestamps {
-		if err := r.deleteAndForget(ctx, timestamp); err != nil {
+	refs = append(refs, r.state.Stale...)
+	for _, ref := range refs {
+		if err := r.deleteAndForget(ctx, ref); err != nil {
 			return err
 		}
 	}
@@ -311,47 +301,44 @@ func (r *Reconciler) deleteStale(ctx context.Context) error {
 	return nil
 }
 
-func (r *Reconciler) deleteAndForget(ctx context.Context, timestamp string) error {
-	err := r.slack.Delete(ctx, timestamp)
-	if err != nil && !errors.Is(err, slack.ErrMessageNotFound) {
+func (r *Reconciler) deleteAndForget(ctx context.Context, ref notifier.MessageRef) error {
+	err := r.destination.Delete(ctx, ref)
+	if err != nil && !errors.Is(err, notifier.ErrMessageNotFound) {
 		return err
 	}
 	updated := cloneState(r.state)
-	if updated.MessageTS == timestamp {
-		updated.MessageTS = ""
+	if updated.Current == ref {
+		updated.Current = ""
 		r.renderedHash = ""
 		r.hasRenderedHash = false
 	}
-	updated.Stale = removeTimestamp(updated.Stale, timestamp)
-	if updated.MessageTS == "" && len(updated.Stale) == 0 && updated.Pending == nil {
-		updated.ChannelID = ""
+	updated.Stale = removeRef(updated.Stale, ref)
+	if updated.Current == "" && len(updated.Stale) == 0 && updated.Pending == nil {
+		updated.DestinationID = ""
 	}
 	if err := r.store.Save(updated); err != nil {
-		return fmt.Errorf("persist deleted Slack status: %w", err)
+		return fmt.Errorf("persist deleted destination status: %w", err)
 	}
 	r.state = updated
 	return nil
 }
 
-func (r *Reconciler) findPending(ctx context.Context, pending *Pending) ([]slack.Message, error) {
-	attemptedAt, err := parseSlackTimestamp(pending.AttemptedAt)
-	if err != nil {
-		return nil, fmt.Errorf("parse pending Slack attempt timestamp: %w", err)
+func (r *Reconciler) findPending(ctx context.Context, pending *Pending) ([]notifier.MessageRef, error) {
+	if pending.AttemptedAt == nil {
+		return nil, errors.New("pending destination post has not been attempted")
 	}
-	oldestTime := attemptedAt.Add(-r.recoverySafetyWindow)
+	oldestTime := pending.AttemptedAt.Add(-r.recoverySafetyWindow)
 	if oldestTime.Before(time.Unix(0, 0)) {
 		oldestTime = time.Unix(0, 0)
 	}
-	oldest := slackTimestamp(oldestTime)
-	return r.slack.FindByOperation(ctx, pending.OperationID, oldest)
+	return r.destination.FindByOperation(ctx, pending.OperationID, oldestTime)
 }
 
-func (r *Reconciler) requireRecoveryGraceElapsed(attemptedAt string) error {
-	attempted, err := parseSlackTimestamp(attemptedAt)
-	if err != nil {
-		return fmt.Errorf("parse pending Slack attempt timestamp: %w", err)
+func (r *Reconciler) requireRecoveryGraceElapsed(attemptedAt *time.Time) error {
+	if attemptedAt == nil {
+		return errors.New("pending destination post has not been attempted")
 	}
-	if r.now().Before(attempted.Add(r.recoveryGracePeriod)) {
+	if r.now().Before(attemptedAt.Add(r.recoveryGracePeriod)) {
 		return ErrPendingRecoveryGrace
 	}
 	return nil
@@ -366,16 +353,16 @@ func (r *Reconciler) save(state State, action string) error {
 }
 
 func cloneState(state State) State {
-	state.Stale = append([]string(nil), state.Stale...)
+	state.Stale = append([]notifier.MessageRef(nil), state.Stale...)
 	if state.Pending != nil {
 		pending := *state.Pending
+		if pending.AttemptedAt != nil {
+			attemptedAt := *pending.AttemptedAt
+			pending.AttemptedAt = &attemptedAt
+		}
 		state.Pending = &pending
 	}
 	return state
-}
-
-func slackTimestamp(value time.Time) string {
-	return fmt.Sprintf("%d.%06d", value.Unix(), value.Nanosecond()/1000)
 }
 
 func contentHash(text string) string {
@@ -394,7 +381,7 @@ func newUUID() (string, error) {
 	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32], nil
 }
 
-func appendUnique(values []string, value string) []string {
+func appendUnique(values []notifier.MessageRef, value notifier.MessageRef) []notifier.MessageRef {
 	for _, existing := range values {
 		if existing == value {
 			return values
@@ -403,7 +390,7 @@ func appendUnique(values []string, value string) []string {
 	return append(values, value)
 }
 
-func removeTimestamp(values []string, target string) []string {
+func removeRef(values []notifier.MessageRef, target notifier.MessageRef) []notifier.MessageRef {
 	result := values[:0]
 	for _, value := range values {
 		if value != target {

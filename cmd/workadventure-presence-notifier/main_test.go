@@ -39,11 +39,17 @@ func TestReadinessTimeoutCoversTwoRequestsAndRecoveryIntervals(t *testing.T) {
 	}
 }
 
-func TestSlackReconciliationTimeoutAccountsForEveryAttemptAndWait(t *testing.T) {
-	cfg := config.Config{Slack: config.SlackConfig{RequestTimeout: 11 * time.Second}}
+func TestDestinationReconciliationTimeoutAccountsForEverySlackAttemptAndWait(t *testing.T) {
+	cfg := config.DestinationConfig{Type: "slack", Slack: config.SlackConfig{
+		BotToken: "test", ChannelID: "C1", Message: "{{ .Users }}", UserSeparator: ", ", RequestTimeout: 11 * time.Second,
+	}}
+	destination, err := newDestination(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := 3*11*time.Second + 2*30*time.Second
-	if got := slackReconciliationTimeout(cfg); got != want {
-		t.Fatalf("slackReconciliationTimeout() = %v, want %v", got, want)
+	if got := destination.reconciliationTimeout; got != want {
+		t.Fatalf("reconciliation timeout = %v, want %v", got, want)
 	}
 }
 

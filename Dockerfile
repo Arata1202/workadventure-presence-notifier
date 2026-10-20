@@ -20,7 +20,7 @@ FROM scratch
 
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="workadventure-presence-notifier" \
-      org.opencontainers.image.description="Maintains an event-driven WorkAdventure presence status in Slack." \
+      org.opencontainers.image.description="Maintains an event-driven WorkAdventure presence status in a configured destination." \
       org.opencontainers.image.source="https://github.com/Arata1202/workadventure-presence-notifier" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}"

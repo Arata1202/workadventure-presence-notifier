@@ -92,7 +92,7 @@ func TestRunContinuesAfterInitialReconciliationFailure(t *testing.T) {
 	ready := make(chan struct{})
 	close(ready)
 	source := &fakeProvider{ready: ready, changes: make(chan struct{}, 1), snapshot: presence.Snapshot{Users: []presence.User{{ID: "1", Name: "Alice"}}}}
-	destination := &recordingReconciler{calls: make(chan struct{}, 4), err: errors.New("Slack unavailable")}
+	destination := &recordingReconciler{calls: make(chan struct{}, 4), err: errors.New("destination unavailable")}
 	coordinator := New(5*time.Millisecond, time.Hour, source, destination, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

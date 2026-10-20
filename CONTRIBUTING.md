@@ -35,7 +35,7 @@ Never commit tokens, production configuration, room URLs, IP addresses, or real 
 
 - Run `gofmt` on Go files.
 - Add or update tests for behavior changes.
-- Keep presence, coordination, state persistence, and Slack transport boundaries focused.
+- Keep providers, coordination, and status reconciliation platform-neutral; isolate platform API details behind the destination interface.
 - Preserve UUID-based user deduplication and avoid logging personal presence data.
 - Keep WorkAdventure compatibility protocol definitions minimal. Do not add fields that are not required by the notifier, especially IP address fields.
 - Regenerate protobuf code with `make generate` after editing `proto/workadventure.proto`.

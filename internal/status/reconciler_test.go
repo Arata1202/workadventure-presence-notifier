@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier/slack"
+	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
 )
 
@@ -31,25 +31,25 @@ func (s *memoryStore) Save(state State) error {
 	return nil
 }
 
-type fakeSlack struct {
-	channel     string
-	postTS      string
-	postErr     error
-	updateErr   error
-	deleteErr   map[string]error
-	findResults [][]slack.Message
-	findErr     error
-	calls       []string
-	postIDs     []string
-	findOldest  []string
-	trace       *[]string
+type fakeDestination struct {
+	destinationID string
+	postTS        notifier.MessageRef
+	postErr       error
+	updateErr     error
+	deleteErr     map[string]error
+	findResults   [][]notifier.MessageRef
+	findErr       error
+	calls         []string
+	postIDs       []string
+	findOldest    []time.Time
+	trace         *[]string
 }
 
-func (s *fakeSlack) ChannelID() string { return s.channel }
-func (s *fakeSlack) Render(snapshot presence.Snapshot) (string, error) {
+func (s *fakeDestination) ID() string { return s.destinationID }
+func (s *fakeDestination) Render(snapshot presence.Snapshot) (string, error) {
 	return snapshot.Users[0].Name, nil
 }
-func (s *fakeSlack) Post(_ context.Context, text, operationID string) (string, error) {
+func (s *fakeDestination) Post(_ context.Context, text, operationID string) (notifier.MessageRef, error) {
 	s.calls = append(s.calls, "post:"+text)
 	s.postIDs = append(s.postIDs, operationID)
 	if s.trace != nil {
@@ -57,15 +57,15 @@ func (s *fakeSlack) Post(_ context.Context, text, operationID string) (string, e
 	}
 	return s.postTS, s.postErr
 }
-func (s *fakeSlack) Update(_ context.Context, ts, text, operationID string) error {
-	s.calls = append(s.calls, "update:"+ts+":"+text+":"+operationID)
+func (s *fakeDestination) Update(_ context.Context, ref notifier.MessageRef, text, operationID string) error {
+	s.calls = append(s.calls, "update:"+string(ref)+":"+text+":"+operationID)
 	return s.updateErr
 }
-func (s *fakeSlack) Delete(_ context.Context, ts string) error {
-	s.calls = append(s.calls, "delete:"+ts)
-	return s.deleteErr[ts]
+func (s *fakeDestination) Delete(_ context.Context, ref notifier.MessageRef) error {
+	s.calls = append(s.calls, "delete:"+string(ref))
+	return s.deleteErr[string(ref)]
 }
-func (s *fakeSlack) FindByOperation(_ context.Context, operationID, oldest string) ([]slack.Message, error) {
+func (s *fakeDestination) FindByOperation(_ context.Context, operationID string, oldest time.Time) ([]notifier.MessageRef, error) {
 	s.calls = append(s.calls, "find:"+operationID)
 	s.findOldest = append(s.findOldest, oldest)
 	if s.findErr != nil {
@@ -81,8 +81,8 @@ func (s *fakeSlack) FindByOperation(_ context.Context, operationID, oldest strin
 
 func TestReconcilePersistsOperationBeforePostThenDeletesOld(t *testing.T) {
 	var trace []string
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", MessageTS: "1000.000000"}, trace: &trace}
-	destination := &fakeSlack{channel: "C1", postTS: "2000.000000", deleteErr: map[string]error{}, trace: &trace}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "1000.000000"}, trace: &trace}
+	destination := &fakeDestination{destinationID: "destination-1", postTS: "2000.000000", deleteErr: map[string]error{}, trace: &trace}
 	reconciler, err := NewReconciler(destination, store)
 	if err != nil {
 		t.Fatal(err)
@@ -93,8 +93,8 @@ func TestReconcilePersistsOperationBeforePostThenDeletesOld(t *testing.T) {
 	if !reflect.DeepEqual(destination.calls, []string{"post:Alice", "delete:1000.000000"}) {
 		t.Fatalf("calls = %#v", destination.calls)
 	}
-	if len(store.saves) != 4 || store.saves[0].Pending == nil || store.saves[0].Pending.AttemptedAt != "" ||
-		store.saves[1].Pending.AttemptedAt == "" || store.saves[2].MessageTS != "2000.000000" {
+	if len(store.saves) != 4 || store.saves[0].Pending == nil || store.saves[0].Pending.AttemptedAt != nil ||
+		store.saves[1].Pending.AttemptedAt == nil || store.saves[2].Current != "2000.000000" {
 		t.Fatalf("saves = %#v", store.saves)
 	}
 	if !reflect.DeepEqual(trace, []string{"save", "save", "post", "save", "save"}) {
@@ -103,18 +103,18 @@ func TestReconcilePersistsOperationBeforePostThenDeletesOld(t *testing.T) {
 }
 
 func TestAcceptedPostWithLostResponseRecoveredThroughHistory(t *testing.T) {
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", MessageTS: "1000.000000"}}
-	destination := &fakeSlack{channel: "C1", postErr: errors.New("lost response"), deleteErr: map[string]error{}}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "1000.000000"}}
+	destination := &fakeDestination{destinationID: "destination-1", postErr: errors.New("lost response"), deleteErr: map[string]error{}}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); err == nil {
 		t.Fatal("first Reconcile() error = nil")
 	}
 	operationID := store.state.Pending.OperationID
-	if store.state.Pending.AttemptedAt == "" {
+	if store.state.Pending.AttemptedAt == nil {
 		t.Fatal("attempt was not persisted")
 	}
 	destination.postErr = nil
-	destination.findResults = [][]slack.Message{{{Timestamp: "2000.000000"}}}
+	destination.findResults = [][]notifier.MessageRef{{"2000.000000"}}
 	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); err != nil {
 		t.Fatal(err)
 	}
@@ -124,35 +124,35 @@ func TestAcceptedPostWithLostResponseRecoveredThroughHistory(t *testing.T) {
 }
 
 func TestMultipleMetadataMatchesChooseNewestAndCleanOthers(t *testing.T) {
-	pending := &Pending{OperationID: "op", AttemptedAt: "1000.000000"}
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", MessageTS: "800.000000", Pending: pending}}
-	destination := &fakeSlack{channel: "C1", deleteErr: map[string]error{}, findResults: [][]slack.Message{{
-		{Timestamp: "901.000001"}, {Timestamp: "902.000001"},
+	pending := &Pending{OperationID: "op", AttemptedAt: timePtr(time.Unix(1000, 0))}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "800.000000", Pending: pending}}
+	destination := &fakeDestination{destinationID: "destination-1", deleteErr: map[string]error{}, findResults: [][]notifier.MessageRef{{
+		"902.000001", "901.000001",
 	}}}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); err != nil {
 		t.Fatal(err)
 	}
-	if store.state.MessageTS != "902.000001" || store.state.Pending != nil {
+	if store.state.Current != "902.000001" || store.state.Pending != nil {
 		t.Fatalf("state = %#v", store.state)
 	}
 	if !reflect.DeepEqual(destination.calls, []string{"find:op", "update:902.000001:Alice:op", "delete:901.000001", "delete:800.000000"}) {
 		t.Fatalf("calls = %#v", destination.calls)
 	}
-	if !reflect.DeepEqual(destination.findOldest, []string{"700.000000"}) {
+	if !reflect.DeepEqual(destination.findOldest, []time.Time{time.Unix(700, 0)}) {
 		t.Fatalf("history oldest = %#v", destination.findOldest)
 	}
 }
 
 func TestMissingHistoryScopeRetainsOldStateAndDoesNotRepost(t *testing.T) {
-	pending := &Pending{OperationID: "op", AttemptedAt: "100.000000"}
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", MessageTS: "90.000000", Pending: pending}}
-	destination := &fakeSlack{channel: "C1", findErr: errors.New("missing_scope"), deleteErr: map[string]error{}}
+	pending := &Pending{OperationID: "op", AttemptedAt: timePtr(time.Unix(100, 0))}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "90.000000", Pending: pending}}
+	destination := &fakeDestination{destinationID: "destination-1", findErr: errors.New("missing_scope"), deleteErr: map[string]error{}}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); err == nil {
 		t.Fatal("Reconcile() error = nil")
 	}
-	if store.state.MessageTS != "90.000000" || store.state.Pending != pending {
+	if store.state.Current != "90.000000" || store.state.Pending != pending {
 		t.Fatalf("state = %#v", store.state)
 	}
 	if !reflect.DeepEqual(destination.calls, []string{"find:op"}) {
@@ -161,17 +161,17 @@ func TestMissingHistoryScopeRetainsOldStateAndDoesNotRepost(t *testing.T) {
 }
 
 func TestUpdateMessageNotFoundRechecksHistoryThenPostsFresh(t *testing.T) {
-	pending := &Pending{OperationID: "op", AttemptedAt: "100.000000"}
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", Pending: pending}}
-	destination := &fakeSlack{
-		channel: "C1", postTS: "300.000000", updateErr: slack.ErrMessageNotFound, deleteErr: map[string]error{},
-		findResults: [][]slack.Message{{{Timestamp: "200.000000"}}, nil},
+	pending := &Pending{OperationID: "op", AttemptedAt: timePtr(time.Unix(100, 0))}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Pending: pending}}
+	destination := &fakeDestination{
+		destinationID: "destination-1", postTS: "300.000000", updateErr: notifier.ErrMessageNotFound, deleteErr: map[string]error{},
+		findResults: [][]notifier.MessageRef{{"200.000000"}, nil},
 	}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), snapshot("Bob"), false); err != nil {
 		t.Fatal(err)
 	}
-	if store.state.MessageTS != "300.000000" || store.state.Pending != nil {
+	if store.state.Current != "300.000000" || store.state.Pending != nil {
 		t.Fatalf("state = %#v", store.state)
 	}
 	wantPrefix := []string{"find:op", "update:200.000000:Bob:op", "find:op", "post:Bob", "delete:200.000000"}
@@ -181,9 +181,9 @@ func TestUpdateMessageNotFoundRechecksHistoryThenPostsFresh(t *testing.T) {
 }
 
 func TestZeroUsersDeletesKnownAndAttemptedPendingMatches(t *testing.T) {
-	pending := &Pending{OperationID: "op", AttemptedAt: "100.000000"}
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", MessageTS: "300.000000", Stale: []string{"200.000000"}, Pending: pending}}
-	destination := &fakeSlack{channel: "C1", deleteErr: map[string]error{}, findResults: [][]slack.Message{{{Timestamp: "400.000000"}}}}
+	pending := &Pending{OperationID: "op", AttemptedAt: timePtr(time.Unix(100, 0))}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "300.000000", Stale: []notifier.MessageRef{"200.000000"}, Pending: pending}}
+	destination := &fakeDestination{destinationID: "destination-1", deleteErr: map[string]error{}, findResults: [][]notifier.MessageRef{{"400.000000"}}}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), presence.Snapshot{}, false); err != nil {
 		t.Fatal(err)
@@ -191,14 +191,14 @@ func TestZeroUsersDeletesKnownAndAttemptedPendingMatches(t *testing.T) {
 	if !reflect.DeepEqual(destination.calls, []string{"delete:300.000000", "delete:200.000000", "find:op", "delete:400.000000"}) {
 		t.Fatalf("calls = %#v", destination.calls)
 	}
-	if store.state.MessageTS != "" || store.state.Pending != nil || store.state.ChannelID != "" {
+	if store.state.Current != "" || store.state.Pending != nil || store.state.DestinationID != "" {
 		t.Fatalf("state = %#v", store.state)
 	}
 }
 
-func TestZeroUsersClearsNeverAttemptedPendingWithoutSlackLookup(t *testing.T) {
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", Pending: &Pending{OperationID: "op"}}}
-	destination := &fakeSlack{channel: "C1", deleteErr: map[string]error{}}
+func TestZeroUsersClearsNeverAttemptedPendingWithoutDestinationLookup(t *testing.T) {
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Pending: &Pending{OperationID: "op"}}}
+	destination := &fakeDestination{destinationID: "destination-1", deleteErr: map[string]error{}}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), presence.Snapshot{}, false); err != nil {
 		t.Fatal(err)
@@ -209,9 +209,9 @@ func TestZeroUsersClearsNeverAttemptedPendingWithoutSlackLookup(t *testing.T) {
 }
 
 func TestZeroUsersHistoryFailureDeletesKnownButRetainsPending(t *testing.T) {
-	pending := &Pending{OperationID: "op", AttemptedAt: "100.000000"}
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", MessageTS: "300.000000", Pending: pending}}
-	destination := &fakeSlack{channel: "C1", findErr: errors.New("missing_scope"), deleteErr: map[string]error{}}
+	pending := &Pending{OperationID: "op", AttemptedAt: timePtr(time.Unix(100, 0))}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "300.000000", Pending: pending}}
+	destination := &fakeDestination{destinationID: "destination-1", findErr: errors.New("missing_scope"), deleteErr: map[string]error{}}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), presence.Snapshot{}, false); err == nil {
 		t.Fatal("Reconcile() error = nil")
@@ -219,14 +219,14 @@ func TestZeroUsersHistoryFailureDeletesKnownButRetainsPending(t *testing.T) {
 	if !reflect.DeepEqual(destination.calls, []string{"delete:300.000000", "find:op"}) {
 		t.Fatalf("calls = %#v", destination.calls)
 	}
-	if store.state.MessageTS != "" || store.state.Pending == nil {
+	if store.state.Current != "" || store.state.Pending == nil {
 		t.Fatalf("state = %#v", store.state)
 	}
 }
 
-func TestPendingSaveFailureMakesNoSlackCall(t *testing.T) {
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", MessageTS: "100.000000"}, saveErr: errors.New("disk full")}
-	destination := &fakeSlack{channel: "C1", postTS: "200.000000", deleteErr: map[string]error{}}
+func TestPendingSaveFailureMakesNoDestinationCall(t *testing.T) {
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "100.000000"}, saveErr: errors.New("disk full")}
+	destination := &fakeDestination{destinationID: "destination-1", postTS: "200.000000", deleteErr: map[string]error{}}
 	reconciler, _ := NewReconciler(destination, store)
 	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); err == nil {
 		t.Fatal("Reconcile() error = nil")
@@ -238,9 +238,9 @@ func TestPendingSaveFailureMakesNoSlackCall(t *testing.T) {
 
 func TestNoMatchWaitsForRecoveryGraceBeforeReposting(t *testing.T) {
 	now := time.Unix(1000, 0)
-	pending := &Pending{OperationID: "op", AttemptedAt: "1000.000000"}
-	store := &memoryStore{state: State{Version: 1, ChannelID: "C1", Pending: pending}}
-	destination := &fakeSlack{channel: "C1", postTS: "1100.000000", deleteErr: map[string]error{}}
+	pending := &Pending{OperationID: "op", AttemptedAt: timePtr(time.Unix(1000, 0))}
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Pending: pending}}
+	destination := &fakeDestination{destinationID: "destination-1", postTS: "1100.000000", deleteErr: map[string]error{}}
 	reconciler, err := NewReconciler(destination, store, Options{Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
@@ -248,21 +248,21 @@ func TestNoMatchWaitsForRecoveryGraceBeforeReposting(t *testing.T) {
 	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); !errors.Is(err, ErrPendingRecoveryGrace) {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if store.state.Pending.AttemptedAt != "1000.000000" || containsCall(destination.calls, "post:Alice") {
+	if store.state.Pending.AttemptedAt == nil || !store.state.Pending.AttemptedAt.Equal(time.Unix(1000, 0)) || containsCall(destination.calls, "post:Alice") {
 		t.Fatalf("calls = %#v, state = %#v", destination.calls, store.state)
 	}
 	now = now.Add(DefaultRecoveryGracePeriod)
 	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); err != nil {
 		t.Fatal(err)
 	}
-	if store.state.MessageTS != "1100.000000" || !containsCall(destination.calls, "post:Alice") {
+	if store.state.Current != "1100.000000" || !containsCall(destination.calls, "post:Alice") {
 		t.Fatalf("calls = %#v, state = %#v", destination.calls, store.state)
 	}
 }
 
 func TestUnchangedReconciliationUsesOnlyInMemoryRenderedHash(t *testing.T) {
-	store := &memoryStore{state: State{Version: 1}}
-	destination := &fakeSlack{channel: "C1", postTS: "1000.000000", deleteErr: map[string]error{}}
+	store := &memoryStore{state: State{Version: stateVersion}}
+	destination := &fakeDestination{destinationID: "destination-1", postTS: "1000.000000", deleteErr: map[string]error{}}
 	reconciler, err := NewReconciler(destination, store)
 	if err != nil {
 		t.Fatal(err)
@@ -281,15 +281,15 @@ func TestUnchangedReconciliationUsesOnlyInMemoryRenderedHash(t *testing.T) {
 
 func TestNewReconcilerRejectsInvalidLoadedState(t *testing.T) {
 	tests := []State{
-		{Version: 1, MessageTS: "100.000000"},
-		{Version: 1, ChannelID: "C2", MessageTS: "100.000000"},
-		{Version: 1, ChannelID: "C1", MessageTS: "invalid"},
-		{Version: 1, ChannelID: "C1", MessageTS: "100.000000", Stale: []string{"100.000000"}},
+		{Version: stateVersion, Current: "100.000000"},
+		{Version: stateVersion, DestinationID: "destination-2", Current: "100.000000"},
+		{Version: stateVersion, DestinationID: "destination-1", Current: " invalid"},
+		{Version: stateVersion, DestinationID: "destination-1", Current: "100.000000", Stale: []notifier.MessageRef{"100.000000"}},
 		{Version: 99},
 	}
 	for _, state := range tests {
 		store := &memoryStore{state: state}
-		if _, err := NewReconciler(&fakeSlack{channel: "C1"}, store); err == nil {
+		if _, err := NewReconciler(&fakeDestination{destinationID: "destination-1"}, store); err == nil {
 			t.Fatalf("NewReconciler() error = nil for %#v", state)
 		}
 	}
@@ -307,3 +307,5 @@ func containsCall(calls []string, target string) bool {
 func snapshot(name string) presence.Snapshot {
 	return presence.Snapshot{Users: []presence.User{{ID: "1", Name: name}}}
 }
+
+func timePtr(value time.Time) *time.Time { return &value }

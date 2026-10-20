@@ -41,8 +41,8 @@ notifiers:
 	if cfg.Status.Debounce != 2*time.Second || cfg.Status.ReconciliationInterval != 20*time.Minute {
 		t.Fatalf("Status = %#v", cfg.Status)
 	}
-	if cfg.Slack.BotToken != "xoxb-test-token" || cfg.Slack.ChannelID != "C012345" || cfg.Slack.RequestTimeout != 7*time.Second {
-		t.Fatalf("Slack = %#v", cfg.Slack)
+	if cfg.Destination.Type != "slack" || cfg.Destination.Slack.BotToken != "xoxb-test-token" || cfg.Destination.Slack.ChannelID != "C012345" || cfg.Destination.Slack.RequestTimeout != 7*time.Second {
+		t.Fatalf("Slack = %#v", cfg.Destination.Slack)
 	}
 }
 

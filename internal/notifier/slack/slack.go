@@ -14,10 +14,9 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
 )
-
-var ErrMessageNotFound = errors.New("Slack message not found")
 
 const (
 	StatusEventType     = "workadventure_presence_status"
@@ -26,10 +25,6 @@ const (
 	HistoryPageSize     = 50
 	MaximumResponseSize = 1 << 20
 )
-
-type Message struct {
-	Timestamp string
-}
 
 type Config struct {
 	BotToken      string
@@ -53,6 +48,8 @@ type Client struct {
 	maxRetryWait  time.Duration
 	retryWait     func(context.Context, time.Duration) error
 }
+
+var _ notifier.Destination = (*Client)(nil)
 
 type templateData struct {
 	Count     int
@@ -159,7 +156,7 @@ func New(config Config, client *http.Client) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) ChannelID() string { return c.channelID }
+func (c *Client) ID() string { return "slack:" + c.channelID }
 
 func (c *Client) Render(snapshot presence.Snapshot) (string, error) {
 	names := make([]string, 0, snapshot.Count())
@@ -176,7 +173,7 @@ func (c *Client) Render(snapshot presence.Snapshot) (string, error) {
 	return output.String(), nil
 }
 
-func (c *Client) Post(ctx context.Context, text, operationID string) (string, error) {
+func (c *Client) Post(ctx context.Context, text, operationID string) (notifier.MessageRef, error) {
 	var response apiResponse
 	err := c.call(ctx, "chat.postMessage", postPayload{
 		Channel: c.channelID, Text: text, Metadata: statusMetadata(operationID),
@@ -188,43 +185,44 @@ func (c *Client) Post(ctx context.Context, text, operationID string) (string, er
 	if response.Timestamp == "" {
 		return "", errors.New("Slack chat.postMessage returned no timestamp")
 	}
-	return response.Timestamp, nil
+	return notifier.MessageRef(response.Timestamp), nil
 }
 
-func (c *Client) Update(ctx context.Context, timestamp, text, operationID string) error {
+func (c *Client) Update(ctx context.Context, ref notifier.MessageRef, text, operationID string) error {
 	var response apiResponse
 	return c.call(ctx, "chat.update", updatePayload{
-		Channel: c.channelID, Timestamp: timestamp, Text: text, Metadata: statusMetadata(operationID),
+		Channel: c.channelID, Timestamp: string(ref), Text: text, Metadata: statusMetadata(operationID),
 		Mrkdwn: true, UnfurlLinks: false, UnfurlMedia: false,
 	}, &response, true)
 }
 
-func (c *Client) Delete(ctx context.Context, timestamp string) error {
-	if timestamp == "" {
+func (c *Client) Delete(ctx context.Context, ref notifier.MessageRef) error {
+	if ref == "" {
 		return nil
 	}
 	var response apiResponse
-	return c.call(ctx, "chat.delete", deletePayload{Channel: c.channelID, Timestamp: timestamp}, &response, true)
+	return c.call(ctx, "chat.delete", deletePayload{Channel: c.channelID, Timestamp: string(ref)}, &response, true)
 }
 
-func (c *Client) FindByOperation(ctx context.Context, operationID, oldest string) ([]Message, error) {
-	var matches []Message
+func (c *Client) FindByOperation(ctx context.Context, operationID string, since time.Time) ([]notifier.MessageRef, error) {
+	var matches []notifier.MessageRef
 	cursor := ""
 	for {
 		var response apiResponse
 		err := c.call(ctx, "conversations.history", historyPayload{
-			Channel: c.channelID, IncludeAllMetadata: true, Oldest: oldest, Cursor: cursor, Limit: HistoryPageSize,
+			Channel: c.channelID, IncludeAllMetadata: true, Oldest: slackTimestamp(since), Cursor: cursor, Limit: HistoryPageSize,
 		}, &response, true)
 		if err != nil {
 			return nil, err
 		}
 		for _, message := range response.Messages {
 			if message.Metadata.EventType == StatusEventType && message.Metadata.EventPayload.OperationID == operationID {
-				matches = append(matches, Message{Timestamp: message.Timestamp})
+				matches = append(matches, notifier.MessageRef(message.Timestamp))
 			}
 		}
 		cursor = response.ResponseMetadata.NextCursor
 		if cursor == "" {
+			sort.Slice(matches, func(i, j int) bool { return matches[i] > matches[j] })
 			return matches, nil
 		}
 	}
@@ -292,7 +290,7 @@ func (c *Client) call(ctx context.Context, method string, payload any, result *a
 		}
 		if !result.OK {
 			if result.Error == "message_not_found" {
-				return ErrMessageNotFound
+				return notifier.ErrMessageNotFound
 			}
 			if retryAmbiguous && isTransientAPIError(result.Error) && attempt < c.maxAttempts {
 				if err := c.retryWait(ctx, retryDelay(attempt)); err != nil {
@@ -309,6 +307,10 @@ func (c *Client) call(ctx context.Context, method string, payload any, result *a
 
 func statusMetadata(operationID string) messageMetadata {
 	return messageMetadata{EventType: StatusEventType, EventPayload: metadataEventPayload{OperationID: operationID}}
+}
+
+func slackTimestamp(value time.Time) string {
+	return fmt.Sprintf("%d.%06d", value.Unix(), value.Nanosecond()/1000)
 }
 
 func retryDelay(attempt int) time.Duration { return time.Duration(attempt) * time.Second }
