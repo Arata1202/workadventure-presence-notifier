@@ -20,9 +20,11 @@ import (
 var ErrMessageNotFound = errors.New("Slack message not found")
 
 const (
-	StatusEventType  = "workadventure_presence_status"
-	DefaultAttempts  = 3
-	MaximumRetryWait = 30 * time.Second
+	StatusEventType     = "workadventure_presence_status"
+	DefaultAttempts     = 3
+	MaximumRetryWait    = 30 * time.Second
+	HistoryPageSize     = 50
+	MaximumResponseSize = 1 << 20
 )
 
 type Message struct {
@@ -211,7 +213,7 @@ func (c *Client) FindByOperation(ctx context.Context, operationID, oldest string
 	for {
 		var response apiResponse
 		err := c.call(ctx, "conversations.history", historyPayload{
-			Channel: c.channelID, IncludeAllMetadata: true, Oldest: oldest, Cursor: cursor, Limit: 200,
+			Channel: c.channelID, IncludeAllMetadata: true, Oldest: oldest, Cursor: cursor, Limit: HistoryPageSize,
 		}, &response, true)
 		if err != nil {
 			return nil, err
@@ -254,9 +256,15 @@ func (c *Client) call(ctx context.Context, method string, payload any, result *a
 			return fmt.Errorf("call Slack %s: request failed", method)
 		}
 		*result = apiResponse{}
-		limited := io.LimitReader(response.Body, 64*1024)
-		decodeErr := json.NewDecoder(limited).Decode(result)
+		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, MaximumResponseSize+1))
 		response.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("read Slack %s response", method)
+		}
+		if len(responseBody) > MaximumResponseSize {
+			return fmt.Errorf("Slack %s response exceeded %d bytes", method, MaximumResponseSize)
+		}
+		decodeErr := json.Unmarshal(responseBody, result)
 		if response.StatusCode == http.StatusTooManyRequests {
 			if attempt < c.maxAttempts {
 				delay := retryAfter(response.Header.Get("Retry-After"), c.maxRetryWait)

@@ -6,22 +6,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 )
 
 const stateVersion = 1
 
 type State struct {
-	Version     int      `json:"version"`
-	ChannelID   string   `json:"channel_id,omitempty"`
-	MessageTS   string   `json:"message_ts,omitempty"`
-	ContentHash string   `json:"content_hash,omitempty"`
-	Stale       []string `json:"stale_message_timestamps,omitempty"`
-	Pending     *Pending `json:"pending_post,omitempty"`
+	Version   int      `json:"version"`
+	ChannelID string   `json:"channel_id,omitempty"`
+	MessageTS string   `json:"message_ts,omitempty"`
+	Stale     []string `json:"stale_message_timestamps,omitempty"`
+	Pending   *Pending `json:"pending_post,omitempty"`
 }
 
 type Pending struct {
 	OperationID string `json:"operation_id"`
-	ContentHash string `json:"content_hash"`
 	AttemptedAt string `json:"attempted_at,omitempty"`
 }
 
@@ -44,11 +45,17 @@ func (s *FileStore) Load() (State, error) {
 	if state.Version != stateVersion {
 		return State{}, fmt.Errorf("unsupported status state version %d", state.Version)
 	}
+	if err := validateState(state); err != nil {
+		return State{}, fmt.Errorf("validate status state: %w", err)
+	}
 	return state, nil
 }
 
 func (s *FileStore) Save(state State) error {
 	state.Version = stateVersion
+	if err := validateState(state); err != nil {
+		return fmt.Errorf("validate status state: %w", err)
+	}
 	directory := filepath.Dir(s.path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create status state directory: %w", err)
@@ -91,4 +98,56 @@ func (s *FileStore) Save(state State) error {
 		return fmt.Errorf("sync status state directory: %w", err)
 	}
 	return nil
+}
+
+func validateState(state State) error {
+	tracked := state.MessageTS != "" || len(state.Stale) > 0 || state.Pending != nil
+	if tracked && state.ChannelID == "" {
+		return errors.New("tracked Slack state requires a channel ID")
+	}
+	if state.MessageTS != "" {
+		if _, err := parseSlackTimestamp(state.MessageTS); err != nil {
+			return fmt.Errorf("invalid current message timestamp: %w", err)
+		}
+	}
+	seen := make(map[string]struct{}, len(state.Stale)+1)
+	if state.MessageTS != "" {
+		seen[state.MessageTS] = struct{}{}
+	}
+	for _, timestamp := range state.Stale {
+		if _, err := parseSlackTimestamp(timestamp); err != nil {
+			return fmt.Errorf("invalid stale message timestamp: %w", err)
+		}
+		if _, exists := seen[timestamp]; exists {
+			return fmt.Errorf("duplicate tracked message timestamp %q", timestamp)
+		}
+		seen[timestamp] = struct{}{}
+	}
+	if state.Pending != nil {
+		if state.Pending.OperationID == "" {
+			return errors.New("pending Slack post requires an operation ID")
+		}
+		if state.Pending.AttemptedAt != "" {
+			if _, err := parseSlackTimestamp(state.Pending.AttemptedAt); err != nil {
+				return fmt.Errorf("invalid pending attempt timestamp: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func parseSlackTimestamp(value string) (time.Time, error) {
+	secondsText, microsText, found := strings.Cut(value, ".")
+	if !found || secondsText == "" || len(microsText) != 6 {
+		return time.Time{}, errors.New("expected seconds and six fractional digits")
+	}
+	seconds, err := strconv.ParseInt(secondsText, 10, 64)
+	if err != nil || seconds < 0 {
+		return time.Time{}, errors.New("invalid seconds")
+	}
+	micros, err := strconv.ParseInt(microsText, 10, 64)
+	if err != nil || micros < 0 {
+		return time.Time{}, errors.New("invalid fractional seconds")
+	}
+	return time.Unix(seconds, micros*int64(time.Microsecond)), nil
 }

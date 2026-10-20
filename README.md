@@ -30,7 +30,7 @@ The process intentionally supports one Slack channel and one service instance pe
 
 The notifier reads `getRooms` and `adminRoom` from WorkAdventure over internal, unencrypted gRPC. Keep `back:50051` on a trusted private network. After a synchronized presence change, the coordinator debounces the snapshot and reconciles it with Slack through `chat.postMessage`, `chat.update`, `chat.delete`, and `conversations.history`. The editable diagram source is available in [Excalidraw format](docs/architecture/workadventure-presence-notifier.excalidraw).
 
-For a non-empty update, the service atomically records a random operation ID and content hash before any Slack call, marks the operation attempted, and attaches only that operation ID as Slack message metadata. If the post result is ambiguous, the next reconciliation searches channel history for the metadata before it can post again. The newest matching message becomes current, duplicate matches and the previous current message become stale, changed content is repaired with `chat.update`, and stale messages are deleted. A crash or failed deletion leaves enough non-sensitive state for recovery or cleanup to be retried. On a SIGINT or SIGTERM shutdown, deletion starts only after the coordinator has stopped and is attempted within `status.shutdown_timeout`; state is cleared only after successful deletion or Slack `message_not_found`.
+For a non-empty update, the service atomically records a random operation ID before any Slack call, marks the operation attempted, and attaches only that operation ID as Slack message metadata. If the post result is ambiguous, the next reconciliation searches channel history from five minutes before the local attempt time to tolerate clock skew. A no-match result cannot trigger a replacement during the 30-second recovery grace period. The newest matching message is unconditionally updated to the current rendered text and becomes current; duplicate matches and the previous current message become stale, and stale messages are deleted. A crash or failed deletion leaves enough non-sensitive state for recovery or cleanup to be retried. On a SIGINT or SIGTERM shutdown, deletion starts only after the coordinator has stopped and is attempted within `status.shutdown_timeout`; state is cleared only after successful deletion or Slack `message_not_found`.
 
 ## Slack app setup
 
@@ -70,7 +70,7 @@ The --once mode gives WorkAdventure readiness and Slack reconciliation separate 
 docker compose -f compose.example.yaml up -d --build
 ~~~
 
-The Compose example mounts a named volume at /var/lib/workadventure-presence-notifier. Keep it across routine VM and container restarts. Losing it can leave an old Slack status that the service cannot identify.
+The Compose example mounts a named volume at /var/lib/workadventure-presence-notifier. Keep it across routine VM and container restarts. Losing it can leave an old Slack status that the service cannot identify. Its 25-second `stop_grace_period` exceeds the example's worst-case 10-second coordinator stop wait plus its 10-second Slack cleanup window, leaving Docker time to deliver SIGTERM before SIGKILL. Increase the grace period if you increase `status.shutdown_timeout`.
 
 ## Configuration
 
@@ -112,7 +112,7 @@ The administrator-authored template is trusted and may contain static Slack link
 
 The state parent directory is created with private permissions when possible. State is written as a mode-0600 temporary file, synced, closed, atomically renamed, and followed by a directory sync.
 
-The file contains Slack channel and message identifiers, a pending operation UUID, its content hash, and a non-sensitive attempt timestamp when recovery is needed. It contains no display names, rendered text, room data, or tokens. The design assumes a single running instance. Do not share one state file between replicas or channels.
+The file contains Slack channel and message identifiers, a pending operation UUID, and a non-sensitive attempt timestamp when recovery is needed. Rendered-content hashes are process-local and are not persisted. The file contains no display names, rendered text, room data, or tokens. The design assumes a single running instance. Do not share one state file between replicas or channels.
 
 ## Docker
 
@@ -137,7 +137,7 @@ The tested baseline is WorkAdventure v1.33.0, with end-to-end coverage also comp
 - WorkAdventure discovery and room subscriptions reconnect automatically.
 - Initial synchronization is best-effort: expected user counts can complete replay early, while `initial_sync_timeout` is the fallback when the protocol cannot prove replay completeness. Rooms discovered with zero expected users wait for that timeout so racing joins are included.
 - Ambiguous `chat.postMessage` outcomes (network failure, HTTP 5xx, `fatal_error`/`internal_error`, decode failure, or a missing timestamp) are not automatically retried. HTTP 429 may be retried because Slack explicitly rejected that attempt; `Retry-After` is honored up to 30 seconds.
-- Other Slack methods use bounded retries. A failed or ambiguous post leaves the previous status current and retains only the operation ID, content hash, and attempt timestamp. Recovery must successfully search message metadata in channel history before posting again.
+- Other Slack methods use bounded retries. Slack responses are limited to 1 MiB, and history is requested in pages of 50 messages. A failed or ambiguous post leaves the previous status current and retains only the operation ID and attempt timestamp. Recovery must successfully search message metadata in channel history and wait through the 30-second visibility grace period before posting again.
 - If history lookup fails because of scope, membership, network, or API errors, the service keeps the valid previous status and pending metadata without guessing or reposting.
 - `chat.update` `message_not_found` triggers another history lookup and, only when no matching message remains, a fresh post attempt.
 - A failed old-message deletion remains recorded and is retried without posting another unchanged status.

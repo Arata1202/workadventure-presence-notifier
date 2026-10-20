@@ -28,24 +28,71 @@ type StateStore interface {
 	Save(State) error
 }
 
-type Reconciler struct {
-	slack Slack
-	store StateStore
-	state State
+const (
+	DefaultRecoverySafetyWindow = 5 * time.Minute
+	DefaultRecoveryGracePeriod  = 30 * time.Second
+)
+
+var ErrPendingRecoveryGrace = errors.New("pending Slack post is still within the recovery grace period")
+
+type Options struct {
+	Now                  func() time.Time
+	RecoverySafetyWindow time.Duration
+	RecoveryGracePeriod  time.Duration
 }
 
-func NewReconciler(destination Slack, store StateStore) (*Reconciler, error) {
+type Reconciler struct {
+	slack                Slack
+	store                StateStore
+	state                State
+	renderedHash         string
+	hasRenderedHash      bool
+	now                  func() time.Time
+	recoverySafetyWindow time.Duration
+	recoveryGracePeriod  time.Duration
+}
+
+func NewReconciler(destination Slack, store StateStore, supplied ...Options) (*Reconciler, error) {
+	if len(supplied) > 1 {
+		return nil, errors.New("only one reconciler options value is supported")
+	}
+	options := Options{
+		Now:                  time.Now,
+		RecoverySafetyWindow: DefaultRecoverySafetyWindow,
+		RecoveryGracePeriod:  DefaultRecoveryGracePeriod,
+	}
+	if len(supplied) == 1 {
+		if supplied[0].Now != nil {
+			options.Now = supplied[0].Now
+		}
+		if supplied[0].RecoverySafetyWindow != 0 {
+			options.RecoverySafetyWindow = supplied[0].RecoverySafetyWindow
+		}
+		if supplied[0].RecoveryGracePeriod != 0 {
+			options.RecoveryGracePeriod = supplied[0].RecoveryGracePeriod
+		}
+	}
+	if options.RecoverySafetyWindow < 0 || options.RecoveryGracePeriod < 0 {
+		return nil, errors.New("recovery timing options must not be negative")
+	}
 	state, err := store.Load()
 	if err != nil {
 		return nil, err
 	}
+	if state.Version != stateVersion {
+		return nil, fmt.Errorf("unsupported status state version %d", state.Version)
+	}
+	if err := validateState(state); err != nil {
+		return nil, fmt.Errorf("validate persisted status state: %w", err)
+	}
 	if state.ChannelID != "" && state.ChannelID != destination.ChannelID() {
 		return nil, errors.New("persisted Slack channel does not match configured channel")
 	}
-	if state.Pending != nil && (state.Pending.OperationID == "" || state.Pending.ContentHash == "") {
-		return nil, errors.New("persisted pending Slack post is incomplete")
-	}
-	return &Reconciler{slack: destination, store: store, state: state}, nil
+	return &Reconciler{
+		slack: destination, store: store, state: state, now: options.Now,
+		recoverySafetyWindow: options.RecoverySafetyWindow,
+		recoveryGracePeriod:  options.RecoveryGracePeriod,
+	}, nil
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, force bool) error {
@@ -63,7 +110,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, 
 		}
 		return nil
 	}
-	if !force && r.state.MessageTS != "" && r.state.ContentHash == hash {
+	if !force && r.state.MessageTS != "" && r.hasRenderedHash && r.renderedHash == hash {
 		return r.deleteStale(ctx)
 	}
 	operationID, err := newUUID()
@@ -72,7 +119,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, 
 	}
 	updated := cloneState(r.state)
 	updated.ChannelID = r.slack.ChannelID()
-	updated.Pending = &Pending{OperationID: operationID, ContentHash: hash}
+	updated.Pending = &Pending{OperationID: operationID}
 	if err := r.store.Save(updated); err != nil {
 		persisted, loadErr := r.store.Load()
 		if loadErr == nil {
@@ -90,12 +137,15 @@ func (r *Reconciler) recoverPending(ctx context.Context, text, currentHash strin
 		return nil
 	}
 	if pending.AttemptedAt != "" {
-		matches, err := r.slack.FindByOperation(ctx, pending.OperationID, pending.AttemptedAt)
+		matches, err := r.findPending(ctx, pending)
 		if err != nil {
 			return fmt.Errorf("find pending Slack status: %w", err)
 		}
 		if len(matches) > 0 {
 			return r.acceptMatches(ctx, matches, text, currentHash)
+		}
+		if err := r.requireRecoveryGraceElapsed(pending.AttemptedAt); err != nil {
+			return err
 		}
 		updated := cloneState(r.state)
 		updated.Pending.AttemptedAt = ""
@@ -104,7 +154,7 @@ func (r *Reconciler) recoverPending(ctx context.Context, text, currentHash strin
 		}
 	}
 	updated := cloneState(r.state)
-	updated.Pending.AttemptedAt = slackTimestamp(time.Now())
+	updated.Pending.AttemptedAt = slackTimestamp(r.now())
 	if err := r.save(updated, "persist attempted Slack post"); err != nil {
 		return err
 	}
@@ -123,21 +173,19 @@ func (r *Reconciler) acceptMatches(ctx context.Context, matches []slack.Message,
 	for _, match := range matches[1:] {
 		stale = appendUnique(stale, match.Timestamp)
 	}
-	if r.state.Pending.ContentHash != currentHash {
-		err := r.slack.Update(ctx, current, text, r.state.Pending.OperationID)
-		if errors.Is(err, slack.ErrMessageNotFound) {
-			return r.recoverAfterMissingUpdate(ctx, current, text, currentHash)
-		}
-		if err != nil {
-			return err
-		}
+	err := r.slack.Update(ctx, current, text, r.state.Pending.OperationID)
+	if errors.Is(err, slack.ErrMessageNotFound) {
+		return r.recoverAfterMissingUpdate(ctx, current, text, currentHash)
+	}
+	if err != nil {
+		return err
 	}
 	return r.finalizePending(ctx, current, stale, currentHash)
 }
 
 func (r *Reconciler) recoverAfterMissingUpdate(ctx context.Context, missingTimestamp, text, currentHash string) error {
 	pending := r.state.Pending
-	matches, err := r.slack.FindByOperation(ctx, pending.OperationID, pending.AttemptedAt)
+	matches, err := r.findPending(ctx, pending)
 	if err != nil {
 		return fmt.Errorf("recheck pending Slack status: %w", err)
 	}
@@ -155,8 +203,15 @@ func (r *Reconciler) recoverAfterMissingUpdate(ctx context.Context, missingTimes
 		}
 		return r.acceptMatches(ctx, filtered, text, currentHash)
 	}
-	updated.Pending.AttemptedAt = ""
 	if err := r.save(updated, "persist missing Slack post recovery"); err != nil {
+		return err
+	}
+	if err := r.requireRecoveryGraceElapsed(pending.AttemptedAt); err != nil {
+		return err
+	}
+	updated = cloneState(r.state)
+	updated.Pending.AttemptedAt = ""
+	if err := r.save(updated, "persist cleared missing Slack post attempt"); err != nil {
 		return err
 	}
 	return r.recoverPending(ctx, text, currentHash)
@@ -167,7 +222,6 @@ func (r *Reconciler) finalizePending(ctx context.Context, newTimestamp string, s
 	updated := cloneState(previous)
 	updated.ChannelID = r.slack.ChannelID()
 	updated.MessageTS = newTimestamp
-	updated.ContentHash = currentHash
 	updated.Pending = nil
 	for _, timestamp := range stale {
 		updated.Stale = appendUnique(updated.Stale, timestamp)
@@ -175,15 +229,22 @@ func (r *Reconciler) finalizePending(ctx context.Context, newTimestamp string, s
 	if previous.MessageTS != "" && previous.MessageTS != newTimestamp {
 		updated.Stale = appendUnique(updated.Stale, previous.MessageTS)
 	}
+	if err := validateState(updated); err != nil {
+		return fmt.Errorf("validate new Slack status: %w", err)
+	}
 	if err := r.store.Save(updated); err != nil {
 		persisted, loadErr := r.store.Load()
 		if loadErr == nil && persisted.Pending == nil && persisted.MessageTS == newTimestamp {
 			r.state = persisted
+			r.renderedHash = currentHash
+			r.hasRenderedHash = true
 			return errors.Join(fmt.Errorf("confirm durable new Slack status: %w", err), r.deleteStale(ctx))
 		}
 		return errors.Join(fmt.Errorf("persist new Slack status: %w", err), loadErr)
 	}
 	r.state = updated
+	r.renderedHash = currentHash
+	r.hasRenderedHash = true
 	return r.deleteStale(ctx)
 }
 
@@ -205,12 +266,17 @@ func (r *Reconciler) reconcileEmpty(ctx context.Context) error {
 		}
 		return r.save(updated, "persist canceled Slack post")
 	}
-	matches, err := r.slack.FindByOperation(ctx, pending.OperationID, pending.AttemptedAt)
+	matches, err := r.findPending(ctx, pending)
 	if err != nil {
 		return fmt.Errorf("find pending Slack status for deletion: %w", err)
 	}
 	for _, match := range matches {
 		if err := r.slack.Delete(ctx, match.Timestamp); err != nil && !errors.Is(err, slack.ErrMessageNotFound) {
+			return err
+		}
+	}
+	if len(matches) == 0 {
+		if err := r.requireRecoveryGraceElapsed(pending.AttemptedAt); err != nil {
 			return err
 		}
 	}
@@ -253,7 +319,8 @@ func (r *Reconciler) deleteAndForget(ctx context.Context, timestamp string) erro
 	updated := cloneState(r.state)
 	if updated.MessageTS == timestamp {
 		updated.MessageTS = ""
-		updated.ContentHash = ""
+		r.renderedHash = ""
+		r.hasRenderedHash = false
 	}
 	updated.Stale = removeTimestamp(updated.Stale, timestamp)
 	if updated.MessageTS == "" && len(updated.Stale) == 0 && updated.Pending == nil {
@@ -263,6 +330,30 @@ func (r *Reconciler) deleteAndForget(ctx context.Context, timestamp string) erro
 		return fmt.Errorf("persist deleted Slack status: %w", err)
 	}
 	r.state = updated
+	return nil
+}
+
+func (r *Reconciler) findPending(ctx context.Context, pending *Pending) ([]slack.Message, error) {
+	attemptedAt, err := parseSlackTimestamp(pending.AttemptedAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse pending Slack attempt timestamp: %w", err)
+	}
+	oldestTime := attemptedAt.Add(-r.recoverySafetyWindow)
+	if oldestTime.Before(time.Unix(0, 0)) {
+		oldestTime = time.Unix(0, 0)
+	}
+	oldest := slackTimestamp(oldestTime)
+	return r.slack.FindByOperation(ctx, pending.OperationID, oldest)
+}
+
+func (r *Reconciler) requireRecoveryGraceElapsed(attemptedAt string) error {
+	attempted, err := parseSlackTimestamp(attemptedAt)
+	if err != nil {
+		return fmt.Errorf("parse pending Slack attempt timestamp: %w", err)
+	}
+	if r.now().Before(attempted.Add(r.recoveryGracePeriod)) {
+		return ErrPendingRecoveryGrace
+	}
 	return nil
 }
 

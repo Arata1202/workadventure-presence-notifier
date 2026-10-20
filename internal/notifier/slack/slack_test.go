@@ -162,7 +162,7 @@ func TestFindByOperationPaginatesAndFiltersMetadata(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if !payload.IncludeAllMetadata || payload.Channel != "C123" || payload.Oldest != "100.000000" {
+		if !payload.IncludeAllMetadata || payload.Channel != "C123" || payload.Oldest != "100.000000" || payload.Limit != HistoryPageSize {
 			t.Fatalf("payload = %#v", payload)
 		}
 		if requests == 1 {
@@ -182,6 +182,51 @@ func TestFindByOperationPaginatesAndFiltersMetadata(t *testing.T) {
 	}
 	if len(matches) != 1 || matches[0].Timestamp != "102" || requests != 2 {
 		t.Fatalf("matches = %#v, requests = %d", matches, requests)
+	}
+}
+
+func TestFindByOperationDecodesHistoryResponseLargerThan64KiB(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload historyPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Limit != HistoryPageSize {
+			t.Fatalf("history limit = %d", payload.Limit)
+		}
+		response := map[string]any{
+			"ok": true,
+			"messages": []any{
+				map[string]any{"ts": "101.000000", "text": strings.Repeat("x", 70*1024)},
+				map[string]any{"ts": "102.000000", "metadata": map[string]any{
+					"event_type":    StatusEventType,
+					"event_payload": map[string]any{"operation_id": "op"},
+				}},
+			},
+		}
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(t, server, Config{})
+	matches, err := client.FindByOperation(context.Background(), "op", "100.000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Timestamp != "102.000000" {
+		t.Fatalf("matches = %#v", matches)
+	}
+}
+
+func TestSlackResponsesRemainBounded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", MaximumResponseSize+1)))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server, Config{MaxAttempts: 1})
+	if _, err := client.FindByOperation(context.Background(), "op", "100.000000"); err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("FindByOperation() error = %v", err)
 	}
 }
 
