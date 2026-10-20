@@ -3,8 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"io"
-	"log/slog"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -76,22 +75,36 @@ func TestCoordinatorMustStopBeforeCleanupCanProceed(t *testing.T) {
 	}
 }
 
-type recordingCleaner struct{ calls int }
+type recordingCleaner struct {
+	calls int
+	err   error
+}
 
 func (c *recordingCleaner) DeleteAll(context.Context) error {
 	c.calls++
-	return nil
+	return c.err
 }
 
 func TestCleanupStatusOnlyRunsForIntentionalShutdown(t *testing.T) {
 	cleaner := &recordingCleaner{}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cleanupStatus(false, time.Second, cleaner, logger)
+	if err := cleanupStatus(false, time.Second, cleaner); err != nil {
+		t.Fatal(err)
+	}
 	if cleaner.calls != 0 {
 		t.Fatalf("DeleteAll() calls after application error = %d", cleaner.calls)
 	}
-	cleanupStatus(true, time.Second, cleaner, logger)
+	if err := cleanupStatus(true, time.Second, cleaner); err != nil {
+		t.Fatal(err)
+	}
 	if cleaner.calls != 1 {
 		t.Fatalf("DeleteAll() calls after intentional shutdown = %d", cleaner.calls)
+	}
+}
+
+func TestCleanupStatusReturnsDeletionFailure(t *testing.T) {
+	cleaner := &recordingCleaner{err: errors.New("Slack unavailable")}
+	err := cleanupStatus(true, time.Second, cleaner)
+	if err == nil || !strings.Contains(err.Error(), "remove destination status during shutdown") {
+		t.Fatalf("cleanupStatus() error = %v", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -276,6 +277,61 @@ func TestUnchangedReconciliationUsesOnlyInMemoryRenderedHash(t *testing.T) {
 	}
 	if !reflect.DeepEqual(destination.calls, callsAfterPost) {
 		t.Fatalf("unchanged reconciliation calls = %#v, want %#v", destination.calls, callsAfterPost)
+	}
+}
+
+func TestForcedReconciliationRefreshesCurrent(t *testing.T) {
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "100.000000"}}
+	destination := &fakeDestination{destinationID: "destination-1", deleteErr: map[string]error{}}
+	reconciler, err := NewReconciler(destination, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), true); err != nil {
+		t.Fatal(err)
+	}
+	if len(destination.calls) != 1 || !strings.HasPrefix(destination.calls[0], "update:100.000000:Alice:") {
+		t.Fatalf("calls = %#v", destination.calls)
+	}
+	if store.state.Current != "100.000000" {
+		t.Fatalf("state = %#v", store.state)
+	}
+}
+
+func TestForcedReconciliationReplacesChangedPresence(t *testing.T) {
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "100.000000"}}
+	destination := &fakeDestination{destinationID: "destination-1", postTS: "200.000000", deleteErr: map[string]error{}}
+	reconciler, err := NewReconciler(destination, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler.renderedHash = contentHash("Alice")
+	reconciler.hasRenderedHash = true
+	if err := reconciler.Reconcile(context.Background(), snapshot("Bob"), true); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(destination.calls, []string{"post:Bob", "delete:100.000000"}) {
+		t.Fatalf("calls = %#v", destination.calls)
+	}
+}
+
+func TestForcedReconciliationRepostsMissingCurrent(t *testing.T) {
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "100.000000"}}
+	destination := &fakeDestination{
+		destinationID: "destination-1", postTS: "200.000000", updateErr: notifier.ErrMessageNotFound, deleteErr: map[string]error{},
+	}
+	reconciler, err := NewReconciler(destination, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), true); err != nil {
+		t.Fatal(err)
+	}
+	if len(destination.calls) != 2 || !strings.HasPrefix(destination.calls[0], "update:100.000000:Alice:") || destination.calls[1] != "post:Alice" {
+		t.Fatalf("calls = %#v", destination.calls)
+	}
+	if store.state.Current != "200.000000" || store.state.Pending != nil {
+		t.Fatalf("state = %#v", store.state)
 	}
 }
 

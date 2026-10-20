@@ -124,23 +124,24 @@ func run(root context.Context, args []string, output io.Writer) error {
 		}
 	}
 	intentionalShutdown := shutdownWasIntentional(root)
-	cleanupStatus(intentionalShutdown, cfg.Status.ShutdownTimeout, reconciler, logger)
-	return runErr
+	cleanupErr := cleanupStatus(intentionalShutdown, cfg.Status.ShutdownTimeout, reconciler)
+	return errors.Join(runErr, cleanupErr)
 }
 
 type statusCleaner interface {
 	DeleteAll(context.Context) error
 }
 
-func cleanupStatus(intentionalShutdown bool, timeout time.Duration, cleaner statusCleaner, logger *slog.Logger) {
+func cleanupStatus(intentionalShutdown bool, timeout time.Duration, cleaner statusCleaner) error {
 	if !intentionalShutdown {
-		return
+		return nil
 	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
 	defer shutdownCancel()
 	if err := cleaner.DeleteAll(shutdownCtx); err != nil {
-		logger.Error("failed to remove destination status during shutdown", "error", err)
+		return fmt.Errorf("remove destination status during shutdown: %w", err)
 	}
+	return nil
 }
 
 func workAdventureReadinessTimeout(cfg config.Config) time.Duration {

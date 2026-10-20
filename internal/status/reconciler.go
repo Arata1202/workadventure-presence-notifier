@@ -100,9 +100,46 @@ func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, 
 		}
 		return nil
 	}
+	if force && r.state.Current != "" {
+		if r.hasRenderedHash && r.renderedHash != hash {
+			return r.startPending(ctx, text, hash)
+		}
+		return r.refreshCurrent(ctx, text, hash)
+	}
 	if !force && r.state.Current != "" && r.hasRenderedHash && r.renderedHash == hash {
 		return r.deleteStale(ctx)
 	}
+	return r.startPending(ctx, text, hash)
+}
+
+func (r *Reconciler) refreshCurrent(ctx context.Context, text, currentHash string) error {
+	operationID, err := newUUID()
+	if err != nil {
+		return fmt.Errorf("generate destination refresh operation ID: %w", err)
+	}
+	err = r.destination.Update(ctx, r.state.Current, text, operationID)
+	if errors.Is(err, notifier.ErrMessageNotFound) {
+		updated := cloneState(r.state)
+		updated.Current = ""
+		if len(updated.Stale) == 0 && updated.Pending == nil {
+			updated.DestinationID = ""
+		}
+		if err := r.save(updated, "persist missing current destination status"); err != nil {
+			return err
+		}
+		r.renderedHash = ""
+		r.hasRenderedHash = false
+		return r.startPending(ctx, text, currentHash)
+	}
+	if err != nil {
+		return err
+	}
+	r.renderedHash = currentHash
+	r.hasRenderedHash = true
+	return r.deleteStale(ctx)
+}
+
+func (r *Reconciler) startPending(ctx context.Context, text, currentHash string) error {
 	operationID, err := newUUID()
 	if err != nil {
 		return fmt.Errorf("generate destination operation ID: %w", err)
@@ -118,7 +155,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, 
 		return errors.Join(fmt.Errorf("persist pending destination post: %w", err), loadErr)
 	}
 	r.state = updated
-	return r.recoverPending(ctx, text, hash)
+	return r.recoverPending(ctx, text, currentHash)
 }
 
 func (r *Reconciler) recoverPending(ctx context.Context, text, currentHash string) error {

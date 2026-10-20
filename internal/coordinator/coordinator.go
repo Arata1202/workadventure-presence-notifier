@@ -48,7 +48,7 @@ func (c *Coordinator) WaitReady(ctx context.Context) error {
 }
 
 func (c *Coordinator) ReconcileReady(ctx context.Context) error {
-	return c.reconcile(ctx, true)
+	return c.reconcile(ctx, false)
 }
 
 func (c *Coordinator) ReconcileOnce(ctx context.Context) error {
@@ -76,28 +76,31 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}()
 
 	nextRetry := c.retryInitial
+	retryForce := false
 	resetRetry := func() {
 		stopTimer(retryTimer)
 		retryTimer = nil
 		retryC = nil
 		nextRetry = c.retryInitial
+		retryForce = false
 	}
-	scheduleRetry := func() {
+	scheduleRetry := func(force bool) {
 		stopTimer(retryTimer)
 		retryTimer = time.NewTimer(nextRetry)
 		retryC = retryTimer.C
+		retryForce = force
 		nextRetry = minDuration(nextRetry*2, c.reconciliationInterval)
 	}
 	reconcile := func(force bool, message string) {
 		if err := c.reconcile(ctx, force); err != nil {
 			c.logger.Error(message, "error", err)
-			scheduleRetry()
+			scheduleRetry(force)
 			return
 		}
 		resetRetry()
 	}
 
-	reconcile(true, "failed to perform initial presence reconciliation")
+	reconcile(false, "failed to perform initial presence reconciliation")
 
 	for {
 		select {
@@ -117,9 +120,9 @@ func (c *Coordinator) Run(ctx context.Context) error {
 			reconcile(false, "failed to reconcile presence status")
 		case <-retryC:
 			retryC = nil
-			reconcile(false, "failed to retry presence reconciliation")
+			reconcile(retryForce, "failed to retry presence reconciliation")
 		case <-ticker.C:
-			reconcile(false, "failed to reconcile presence status")
+			reconcile(true, "failed to reconcile presence status")
 		}
 	}
 }

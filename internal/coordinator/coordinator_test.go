@@ -79,7 +79,30 @@ func TestRunWaitsForInitialSnapshotAndCoalescesChanges(t *testing.T) {
 	destination.mu.Lock()
 	forces := append([]bool(nil), destination.forces...)
 	destination.mu.Unlock()
-	if len(forces) != 2 || !forces[0] || forces[1] {
+	if len(forces) != 2 || forces[0] || forces[1] {
+		t.Fatalf("forces = %#v", forces)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPeriodicReconciliationForcesDestinationRefresh(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	source := &fakeProvider{ready: ready, changes: make(chan struct{}, 1), snapshot: presence.Snapshot{Users: []presence.User{{ID: "1", Name: "Alice"}}}}
+	destination := &recordingReconciler{calls: make(chan struct{}, 4)}
+	coordinator := New(time.Hour, 20*time.Millisecond, source, destination, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	waitCall(t, destination.calls)
+	waitCall(t, destination.calls)
+	destination.mu.Lock()
+	forces := append([]bool(nil), destination.forces...)
+	destination.mu.Unlock()
+	if len(forces) < 2 || forces[0] || !forces[1] {
 		t.Fatalf("forces = %#v", forces)
 	}
 	cancel()

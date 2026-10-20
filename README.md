@@ -4,9 +4,9 @@
 [![GitHub release](https://img.shields.io/github/v/release/Arata1202/workadventure-presence-notifier)](https://github.com/Arata1202/workadventure-presence-notifier/releases/latest)
 [![License](https://img.shields.io/github/license/Arata1202/workadventure-presence-notifier)](LICENSE)
 
-Maintains one current WorkAdventure presence message in a configured destination. Version 0.2 ships with a Slack destination.
+Maintains one current WorkAdventure presence message in a configured destination. Version 0.2 includes a Slack destination.
 
-Version 0.2 is an event-driven redesign. It uses a Slack bot, replaces the message after debounced presence changes, and removes it when nobody is present. The periodic Incoming Webhook implementation remains available as [v0.1.0](https://github.com/Arata1202/workadventure-presence-notifier/releases/tag/v0.1.0).
+Version 0.2 introduces an event-driven redesign. It uses a Slack bot, replaces the message after debounced presence changes, and removes it when nobody is present. The periodic Incoming Webhook implementation remains available as [v0.1.0](https://github.com/Arata1202/workadventure-presence-notifier/releases/tag/v0.1.0).
 
 ## Behavior
 
@@ -17,7 +17,7 @@ Version 0.2 is an event-driven redesign. It uses a Slack bot, replaces the messa
 - Posts the new Slack status before deleting the old one
 - Deletes the status without a replacement when no users are present
 - Persists message state atomically so failed cleanup is retried after restart
-- Reconciles every 30 minutes without calling Slack when rendered presence is unchanged
+- Refreshes the known status every 30 minutes and recreates it if it was deleted externally
 - Escapes display names while preserving trusted mrkdwn in the configured template
 - Disables Slack link and media unfurls
 - Does not retain or log display names, room URLs, IP addresses, tokens, or Slack response bodies
@@ -30,7 +30,7 @@ The process intentionally supports one configured destination and one service in
 
 The notifier reads `getRooms` and `adminRoom` from WorkAdventure over internal, unencrypted gRPC. Keep `back:50051` on a trusted private network. After a synchronized presence change, the platform-neutral coordinator sends the snapshot to a platform-neutral status reconciler. The configured destination adapter owns rendering, message references, recovery lookup, and API errors. The included Slack adapter implements those operations through `chat.postMessage`, `chat.update`, `chat.delete`, and `conversations.history`. Adding another built-in adapter does not change the presence provider, coordinator, or reconciler. The editable diagram source is available in [Excalidraw format](docs/architecture/workadventure-presence-notifier.excalidraw).
 
-For a non-empty update, the service atomically records a random operation ID before any Slack call, marks the operation attempted, and attaches only that operation ID as Slack message metadata. If the post result is ambiguous, the next reconciliation searches channel history from five minutes before the local attempt time to tolerate clock skew. A no-match result cannot trigger a replacement during the 30-second recovery grace period. The newest matching message is unconditionally updated to the current rendered text and becomes current; duplicate matches and the previous current message become stale, and stale messages are deleted. A crash or failed deletion leaves enough non-sensitive state for recovery or cleanup to be retried. On a SIGINT or SIGTERM shutdown, deletion starts only after the coordinator has stopped and is attempted within `status.shutdown_timeout`; state is cleared only after successful deletion or Slack `message_not_found`.
+For a non-empty update, the service atomically records a random operation ID before any Slack call, marks the operation attempted, and attaches only that operation ID as Slack message metadata. If the post result is ambiguous, the next reconciliation searches channel history from five minutes before the local attempt time to tolerate clock skew. A no-match result cannot trigger a replacement during the 30-second recovery grace period. The newest matching message is unconditionally updated to the current rendered text and becomes current; duplicate matches and the previous current message become stale, and stale messages are deleted. A crash or failed deletion leaves enough non-sensitive state for recovery or cleanup to be retried. On a SIGINT or SIGTERM shutdown, deletion starts only after the coordinator has stopped and is attempted within `status.shutdown_timeout`; state is cleared only after successful deletion or Slack `message_not_found`. When rendered presence is unchanged, periodic reconciliation updates the known current message in place; if it was deleted externally, the missing reference is cleared before the normal replacement flow posts a new status. A missed presence change still uses the usual post-new-then-delete-old flow.
 
 ## Slack app setup
 
@@ -145,6 +145,7 @@ The tested baseline is WorkAdventure v1.33.0, with end-to-end coverage also comp
 - A failed old-message deletion remains recorded and is retried without posting another unchanged status.
 - message_not_found is successful idempotent deletion.
 - Reconciliation failures retry after 30 seconds with capped exponential backoff up to `status.reconciliation_interval`; a successful reconciliation or new presence change resets the backoff.
+- An intentional shutdown exits with an error if status deletion cannot complete; persisted state remains available for a later cleanup retry.
 - A malformed or incompatible state file stops startup instead of losing cleanup information.
 
 ## Development
