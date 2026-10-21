@@ -6,7 +6,7 @@
 
 Maintains one current WorkAdventure presence message in a configured destination. Version 0.2 includes a Slack destination.
 
-Version 0.2 introduces an event-driven redesign. It uses a Slack bot, replaces the message after debounced presence changes, and removes it when nobody is present. The periodic Incoming Webhook implementation remains available as [v0.1.0](https://github.com/Arata1202/workadventure-presence-notifier/releases/tag/v0.1.0).
+Version 0.2 uses a Slack bot, replaces the message after debounced presence changes, and removes it when nobody is present.
 
 ## Behavior
 
@@ -20,7 +20,7 @@ Version 0.2 introduces an event-driven redesign. It uses a Slack bot, replaces t
 - Refreshes the known status every 30 minutes and recreates it if it was deleted externally
 - Escapes display names while preserving trusted mrkdwn in the configured template
 - Disables Slack link and media unfurls
-- Does not retain or log display names, room URLs, IP addresses, tokens, or Slack response bodies
+- Does not persist or log display names, room URLs, IP addresses, tokens, or Slack response bodies
 
 The process intentionally supports one configured destination and one service instance per state file.
 
@@ -150,7 +150,7 @@ The tested baseline is WorkAdventure v1.33.0, with end-to-end coverage also comp
 
 ## Development
 
-Requirements are Go 1.27.2 or later and Docker.
+Requirements are Go 1.27.3 or later and Docker.
 
 ~~~sh
 test -z "$(gofmt -l .)"

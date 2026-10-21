@@ -13,7 +13,7 @@ Contributions are welcome. Please keep changes focused, documented, and safe for
 
 Requirements:
 
-- Go 1.27.2 or later
+- Go 1.27.3 or later
 - Docker
 
 Clone the repository, then run:
