@@ -4,17 +4,18 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-const SlackWebhookEnv = "SLACK_WEBHOOK_URL"
+const SlackBotTokenEnv = "SLACK_BOT_TOKEN"
 
 type Config struct {
 	WorkAdventure WorkAdventureConfig
-	Notification  NotificationConfig
+	Status        StatusConfig
 	Slack         SlackConfig
 }
 
@@ -26,21 +27,24 @@ type WorkAdventureConfig struct {
 	RequestTimeout        time.Duration
 }
 
-type NotificationConfig struct {
-	Interval time.Duration
+type StatusConfig struct {
+	Debounce        time.Duration
+	ShutdownTimeout time.Duration
+	StateFile       string
 }
 
 type SlackConfig struct {
-	WebhookURL    string
-	Message       string
-	EmptyMessage  string
-	UserSeparator string
+	BotToken       string
+	ChannelID      string
+	Message        string
+	UserSeparator  string
+	RequestTimeout time.Duration
 }
 
 type fileConfig struct {
 	WorkAdventure fileWorkAdventure `yaml:"workadventure"`
-	Notification  fileNotification  `yaml:"notification"`
-	Notifiers     fileNotifiers     `yaml:"notifiers"`
+	Status        fileStatus        `yaml:"status"`
+	Destination   fileDestination   `yaml:"destination"`
 }
 
 type fileWorkAdventure struct {
@@ -51,18 +55,21 @@ type fileWorkAdventure struct {
 	RequestTimeout        string `yaml:"request_timeout"`
 }
 
-type fileNotification struct {
-	Interval string `yaml:"interval"`
+type fileStatus struct {
+	Debounce        string `yaml:"debounce"`
+	ShutdownTimeout string `yaml:"shutdown_timeout"`
+	StateFile       string `yaml:"state_file"`
 }
 
-type fileNotifiers struct {
+type fileDestination struct {
 	Slack fileSlack `yaml:"slack"`
 }
 
 type fileSlack struct {
-	Message       string `yaml:"message"`
-	EmptyMessage  string `yaml:"empty_message"`
-	UserSeparator string `yaml:"user_separator"`
+	ChannelID      string `yaml:"channel_id"`
+	Message        string `yaml:"message"`
+	UserSeparator  string `yaml:"user_separator"`
+	RequestTimeout string `yaml:"request_timeout"`
 }
 
 func Load(path string) (Config, error) {
@@ -70,74 +77,79 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read configuration: %w", err)
 	}
-
 	var file fileConfig
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&file); err != nil {
 		return Config{}, fmt.Errorf("decode configuration: %w", err)
 	}
-
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return Config{}, errors.New("decode configuration: multiple YAML documents are not supported")
+		}
+		return Config{}, fmt.Errorf("decode configuration: %w", err)
+	}
 	cfg, err := file.toConfig()
 	if err != nil {
 		return Config{}, err
 	}
-
-	cfg.Slack.WebhookURL = os.Getenv(SlackWebhookEnv)
-	if cfg.Slack.WebhookURL == "" {
-		return Config{}, fmt.Errorf("%s is required", SlackWebhookEnv)
+	cfg.Slack.BotToken = os.Getenv(SlackBotTokenEnv)
+	if cfg.Slack.BotToken == "" {
+		return Config{}, fmt.Errorf("%s is required", SlackBotTokenEnv)
 	}
-
 	return cfg, nil
 }
 
 func (f fileConfig) toConfig() (Config, error) {
 	cfg := Config{
 		WorkAdventure: WorkAdventureConfig{
-			Address:               defaultString(f.WorkAdventure.Address, "back:50051"),
-			RoomDiscoveryInterval: 30 * time.Second,
-			ReconnectInterval:     5 * time.Second,
-			InitialSyncTimeout:    2 * time.Second,
-			RequestTimeout:        10 * time.Second,
+			Address: defaultString(f.WorkAdventure.Address, "back:50051"), RoomDiscoveryInterval: 30 * time.Second,
+			ReconnectInterval: 5 * time.Second, InitialSyncTimeout: 2 * time.Second, RequestTimeout: 10 * time.Second,
 		},
-		Notification: NotificationConfig{Interval: 30 * time.Minute},
+		Status: StatusConfig{
+			Debounce: 5 * time.Second, ShutdownTimeout: 10 * time.Second,
+			StateFile: defaultString(f.Status.StateFile, "/var/lib/workadventure-presence-notifier/state.json"),
+		},
 		Slack: SlackConfig{
-			Message:       defaultString(f.Notifiers.Slack.Message, "Currently online ({{ .Count }}): {{ .Users }}"),
-			EmptyMessage:  defaultString(f.Notifiers.Slack.EmptyMessage, "No users are currently online."),
-			UserSeparator: defaultString(f.Notifiers.Slack.UserSeparator, ", "),
+			ChannelID:     f.Destination.Slack.ChannelID,
+			Message:       defaultString(f.Destination.Slack.Message, "Currently online ({{ .Count }}): {{ .Users }}"),
+			UserSeparator: defaultString(f.Destination.Slack.UserSeparator, ", "), RequestTimeout: 10 * time.Second,
 		},
 	}
-
 	var err error
-	if cfg.WorkAdventure.RoomDiscoveryInterval, err = parseDuration("workadventure.room_discovery_interval", f.WorkAdventure.RoomDiscoveryInterval, cfg.WorkAdventure.RoomDiscoveryInterval); err != nil {
-		return Config{}, err
+	for _, duration := range []struct {
+		name, value string
+		target      *time.Duration
+	}{
+		{"workadventure.room_discovery_interval", f.WorkAdventure.RoomDiscoveryInterval, &cfg.WorkAdventure.RoomDiscoveryInterval},
+		{"workadventure.reconnect_interval", f.WorkAdventure.ReconnectInterval, &cfg.WorkAdventure.ReconnectInterval},
+		{"workadventure.initial_sync_timeout", f.WorkAdventure.InitialSyncTimeout, &cfg.WorkAdventure.InitialSyncTimeout},
+		{"workadventure.request_timeout", f.WorkAdventure.RequestTimeout, &cfg.WorkAdventure.RequestTimeout},
+		{"status.debounce", f.Status.Debounce, &cfg.Status.Debounce},
+		{"status.shutdown_timeout", f.Status.ShutdownTimeout, &cfg.Status.ShutdownTimeout},
+		{"destination.slack.request_timeout", f.Destination.Slack.RequestTimeout, &cfg.Slack.RequestTimeout},
+	} {
+		*duration.target, err = parseDuration(duration.name, duration.value, *duration.target)
+		if err != nil {
+			return Config{}, err
+		}
 	}
-	if cfg.WorkAdventure.ReconnectInterval, err = parseDuration("workadventure.reconnect_interval", f.WorkAdventure.ReconnectInterval, cfg.WorkAdventure.ReconnectInterval); err != nil {
-		return Config{}, err
-	}
-	if cfg.WorkAdventure.InitialSyncTimeout, err = parseDuration("workadventure.initial_sync_timeout", f.WorkAdventure.InitialSyncTimeout, cfg.WorkAdventure.InitialSyncTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.WorkAdventure.RequestTimeout, err = parseDuration("workadventure.request_timeout", f.WorkAdventure.RequestTimeout, cfg.WorkAdventure.RequestTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.Notification.Interval, err = parseDuration("notification.interval", f.Notification.Interval, cfg.Notification.Interval); err != nil {
-		return Config{}, err
-	}
-
 	if cfg.WorkAdventure.Address == "" {
 		return Config{}, errors.New("workadventure.address is required")
 	}
-	if cfg.Slack.Message == "" {
-		return Config{}, errors.New("notifiers.slack.message is required")
+	if cfg.Status.StateFile == "" {
+		return Config{}, errors.New("status.state_file is required")
 	}
-	if cfg.Slack.EmptyMessage == "" {
-		return Config{}, errors.New("notifiers.slack.empty_message is required")
+	if cfg.Slack.ChannelID == "" {
+		return Config{}, errors.New("destination.slack.channel_id is required")
+	}
+	if cfg.Slack.Message == "" {
+		return Config{}, errors.New("destination.slack.message is required")
 	}
 	if cfg.Slack.UserSeparator == "" {
-		return Config{}, errors.New("notifiers.slack.user_separator is required")
+		return Config{}, errors.New("destination.slack.user_separator is required")
 	}
-
 	return cfg, nil
 }
 
