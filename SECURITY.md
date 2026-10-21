@@ -25,7 +25,7 @@ Include the following information when possible:
 - Relevant deployment details, such as the WorkAdventure version
 - Suggested mitigations, if known
 
-Do not include Slack webhook URLs, access tokens, production configuration, IP addresses, room URLs, or real user presence data in the report.
+Do not include Slack bot tokens, production configuration, IP addresses, room URLs, or real user presence data in the report.
 
 The maintainer will review the report, coordinate remediation and disclosure, and publish a security advisory when appropriate. Response times are best effort; this project does not currently provide a formal security SLA.
 
@@ -33,4 +33,4 @@ The maintainer will review the report, coordinate remediation and disclosure, an
 
 This service connects directly to WorkAdventure's internal, unencrypted gRPC endpoint. Keep that endpoint on a trusted private network and do not expose it publicly.
 
-Slack webhook URLs are secrets. Provide them only through the `SLACK_WEBHOOK_URL` environment variable, keep them out of configuration files and logs, and rotate them immediately if they are exposed.
+Slack bot tokens are secrets. Provide them only through the `SLACK_BOT_TOKEN` environment variable, keep them out of configuration files and logs, and rotate them immediately if they are exposed.
