@@ -107,7 +107,9 @@ type apiResponse struct {
 		Metadata  messageMetadata `json:"metadata"`
 	} `json:"messages"`
 	ResponseMetadata struct {
-		NextCursor string `json:"next_cursor"`
+		NextCursor string   `json:"next_cursor"`
+		Warnings   []string `json:"warnings"`
+		Messages   []string `json:"messages"`
 	} `json:"response_metadata"`
 }
 
@@ -180,6 +182,9 @@ func (c *Client) Post(ctx context.Context, text, operationID string) (notifier.M
 		Mrkdwn: true, UnfurlLinks: false, UnfurlMedia: false,
 	}, &response, false)
 	if err != nil {
+		if response.Timestamp != "" {
+			return notifier.MessageRef(response.Timestamp), err
+		}
 		return "", err
 	}
 	if response.Timestamp == "" {
@@ -300,6 +305,9 @@ func (c *Client) call(ctx context.Context, method string, payload any, result *a
 			}
 			return fmt.Errorf("Slack %s failed: %s", method, safeErrorCode(result.Error))
 		}
+		if hasMetadataWarning(result.ResponseMetadata.Warnings, result.ResponseMetadata.Messages) {
+			return fmt.Errorf("Slack %s ignored message metadata; register the metadata event schema in the Slack app manifest", method)
+		}
 		return nil
 	}
 	return fmt.Errorf("Slack %s failed", method)
@@ -342,6 +350,17 @@ func safeErrorCode(code string) string {
 	}
 	return code
 }
+func hasMetadataWarning(groups ...[]string) bool {
+	for _, group := range groups {
+		for _, warning := range group {
+			if strings.Contains(strings.ToLower(warning), "metadata") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func escapeSlackText(value string) string {
 	value = strings.ReplaceAll(value, "&", "&amp;")
 	value = strings.ReplaceAll(value, "<", "&lt;")

@@ -68,6 +68,18 @@ func TestPostUsesBotAPIAndDisablesUnfurls(t *testing.T) {
 	}
 }
 
+func TestPostRejectsIgnoredMetadataWarning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("{\"ok\":true,\"ts\":\"123.456\",\"response_metadata\":{\"warnings\":[\"metadata_event_type_not_registered\"]}}"))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server, Config{})
+	ref, err := client.Post(context.Background(), "hello", "operation-id")
+	if err == nil || !strings.Contains(err.Error(), "ignored message metadata") || ref != "123.456" {
+		t.Fatalf("Post() = %q, %v", ref, err)
+	}
+}
+
 func TestAPIOkFalseAndMessageNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "chat.delete") {

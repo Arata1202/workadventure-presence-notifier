@@ -95,10 +95,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, snapshot presence.Snapshot, 
 	}
 	hash := contentHash(text)
 	if r.state.Pending != nil {
+		if err := r.deleteStale(ctx); err != nil {
+			return err
+		}
 		if err := r.recoverPending(ctx, text, hash); err != nil {
 			return err
 		}
 		return nil
+	}
+	// A stale message can become permanently undeletable, for example after a
+	// Slack bot rotation. Keep the current message accurate without creating an
+	// additional replacement on every presence change while cleanup is blocked.
+	if r.state.Current != "" && len(r.state.Stale) > 0 {
+		return r.refreshCurrent(ctx, text, hash)
 	}
 	if force && r.state.Current != "" {
 		if r.hasRenderedHash && r.renderedHash != hash {
@@ -187,9 +196,17 @@ func (r *Reconciler) recoverPending(ctx context.Context, text, currentHash strin
 		return err
 	}
 	pending = r.state.Pending
-	newRef, err := r.destination.Post(ctx, text, pending.OperationID)
-	if err != nil {
-		return err
+	newRef, postErr := r.destination.Post(ctx, text, pending.OperationID)
+	if postErr != nil {
+		if newRef == "" {
+			return postErr
+		}
+		updated := cloneState(r.state)
+		updated.Stale = appendUnique(updated.Stale, newRef)
+		if err := r.save(updated, "persist rejected destination status"); err != nil {
+			return errors.Join(postErr, err)
+		}
+		return errors.Join(postErr, r.deleteStale(ctx))
 	}
 	return r.finalizePending(ctx, newRef, nil, currentHash)
 }
@@ -278,12 +295,10 @@ func (r *Reconciler) finalizePending(ctx context.Context, newRef notifier.Messag
 func (r *Reconciler) DeleteAll(ctx context.Context) error { return r.reconcileEmpty(ctx) }
 
 func (r *Reconciler) reconcileEmpty(ctx context.Context) error {
-	if err := r.deleteAll(ctx); err != nil {
-		return err
-	}
+	result := r.deleteAll(ctx)
 	pending := r.state.Pending
 	if pending == nil {
-		return nil
+		return result
 	}
 	if pending.AttemptedAt == nil {
 		updated := cloneState(r.state)
@@ -291,28 +306,33 @@ func (r *Reconciler) reconcileEmpty(ctx context.Context) error {
 		if updated.Current == "" && len(updated.Stale) == 0 {
 			updated.DestinationID = ""
 		}
-		return r.save(updated, "persist canceled destination post")
+		return errors.Join(result, r.save(updated, "persist canceled destination post"))
 	}
 	matches, err := r.findPending(ctx, pending)
 	if err != nil {
-		return fmt.Errorf("find pending destination status for deletion: %w", err)
+		return errors.Join(result, fmt.Errorf("find pending destination status for deletion: %w", err))
 	}
+	var pendingDeleteErr error
 	for _, match := range matches {
-		if err := r.destination.Delete(ctx, match); err != nil && !errors.Is(err, notifier.ErrMessageNotFound) {
-			return err
+		deleteErr := r.destination.Delete(ctx, match)
+		if deleteErr != nil && !errors.Is(deleteErr, notifier.ErrMessageNotFound) {
+			pendingDeleteErr = errors.Join(pendingDeleteErr, deleteErr)
 		}
 	}
 	if len(matches) == 0 {
 		if err := r.requireRecoveryGraceElapsed(pending.AttemptedAt); err != nil {
-			return err
+			return errors.Join(result, err)
 		}
+	}
+	if pendingDeleteErr != nil {
+		return errors.Join(result, pendingDeleteErr)
 	}
 	updated := cloneState(r.state)
 	updated.Pending = nil
 	if updated.Current == "" && len(updated.Stale) == 0 {
 		updated.DestinationID = ""
 	}
-	return r.save(updated, "persist deleted pending destination status")
+	return errors.Join(result, r.save(updated, "persist deleted pending destination status"))
 }
 
 func (r *Reconciler) deleteAll(ctx context.Context) error {
@@ -321,21 +341,20 @@ func (r *Reconciler) deleteAll(ctx context.Context) error {
 		refs = append(refs, r.state.Current)
 	}
 	refs = append(refs, r.state.Stale...)
+	var result error
 	for _, ref := range refs {
-		if err := r.deleteAndForget(ctx, ref); err != nil {
-			return err
-		}
+		result = errors.Join(result, r.deleteAndForget(ctx, ref))
 	}
-	return nil
+	return result
 }
 
 func (r *Reconciler) deleteStale(ctx context.Context) error {
-	for len(r.state.Stale) > 0 {
-		if err := r.deleteAndForget(ctx, r.state.Stale[0]); err != nil {
-			return err
-		}
+	refs := append([]notifier.MessageRef(nil), r.state.Stale...)
+	var result error
+	for _, ref := range refs {
+		result = errors.Join(result, r.deleteAndForget(ctx, ref))
 	}
-	return nil
+	return result
 }
 
 func (r *Reconciler) deleteAndForget(ctx context.Context, ref notifier.MessageRef) error {

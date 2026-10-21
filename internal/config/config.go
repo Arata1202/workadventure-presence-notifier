@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -88,6 +89,13 @@ func Load(path string) (Config, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&file); err != nil {
+		return Config{}, fmt.Errorf("decode configuration: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return Config{}, errors.New("decode configuration: multiple YAML documents are not supported")
+		}
 		return Config{}, fmt.Errorf("decode configuration: %w", err)
 	}
 	cfg, err := file.toConfig()

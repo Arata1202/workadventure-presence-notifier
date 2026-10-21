@@ -46,7 +46,7 @@ func TestDestinationReconciliationTimeoutAccountsForEverySlackAttemptAndWait(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := 3*11*time.Second + 2*30*time.Second
+	want := minimumOnceReconciliationTimeout
 	if got := destination.reconciliationTimeout; got != want {
 		t.Fatalf("reconciliation timeout = %v, want %v", got, want)
 	}

@@ -103,6 +103,54 @@ func TestReconcilePersistsOperationBeforePostThenDeletesOld(t *testing.T) {
 	}
 }
 
+func TestPostWarningWithKnownReferencePreservesCurrentAndCleansRejectedPost(t *testing.T) {
+	warning := errors.New("metadata ignored")
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "1000.000000"}}
+	destination := &fakeDestination{
+		destinationID: "destination-1", postTS: "2000.000000", postErr: warning,
+		deleteErr: map[string]error{},
+	}
+	reconciler, err := NewReconciler(destination, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); !errors.Is(err, warning) {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if store.state.Current != "1000.000000" || store.state.Pending == nil || len(store.state.Stale) != 0 {
+		t.Fatalf("state = %#v", store.state)
+	}
+	if !containsCall(destination.calls, "delete:2000.000000") {
+		t.Fatalf("rejected post was not cleaned: calls = %#v", destination.calls)
+	}
+}
+
+func TestRejectedPostCleanupFailureBlocksAnotherPost(t *testing.T) {
+	warning := errors.New("metadata ignored")
+	deleteFailure := errors.New("cant_delete_message")
+	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "1000.000000"}}
+	destination := &fakeDestination{
+		destinationID: "destination-1", postTS: "2000.000000", postErr: warning,
+		deleteErr: map[string]error{"2000.000000": deleteFailure},
+	}
+	reconciler, _ := NewReconciler(destination, store)
+	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); err == nil {
+		t.Fatal("first Reconcile() error = nil")
+	}
+	if err := reconciler.Reconcile(context.Background(), snapshot("Bob"), false); !errors.Is(err, deleteFailure) {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	posts := 0
+	for _, call := range destination.calls {
+		if strings.HasPrefix(call, "post:") {
+			posts++
+		}
+	}
+	if posts != 1 || store.state.Current != "1000.000000" || store.state.Pending == nil || !reflect.DeepEqual(store.state.Stale, []notifier.MessageRef{"2000.000000"}) {
+		t.Fatalf("posts = %d, calls = %#v, state = %#v", posts, destination.calls, store.state)
+	}
+}
+
 func TestAcceptedPostWithLostResponseRecoveredThroughHistory(t *testing.T) {
 	store := &memoryStore{state: State{Version: stateVersion, DestinationID: "destination-1", Current: "1000.000000"}}
 	destination := &fakeDestination{destinationID: "destination-1", postErr: errors.New("lost response"), deleteErr: map[string]error{}}
@@ -194,6 +242,30 @@ func TestZeroUsersDeletesKnownAndAttemptedPendingMatches(t *testing.T) {
 	}
 	if store.state.Current != "" || store.state.Pending != nil || store.state.DestinationID != "" {
 		t.Fatalf("state = %#v", store.state)
+	}
+}
+
+func TestZeroUsersCleansPendingMatchDespitePermanentStaleDeleteFailure(t *testing.T) {
+	deleteFailure := errors.New("cant_delete_message")
+	pending := &Pending{OperationID: "op", AttemptedAt: timePtr(time.Unix(100, 0))}
+	store := &memoryStore{state: State{
+		Version: stateVersion, DestinationID: "destination-1",
+		Stale: []notifier.MessageRef{"100.000000"}, Pending: pending,
+	}}
+	destination := &fakeDestination{
+		destinationID: "destination-1",
+		deleteErr:     map[string]error{"100.000000": deleteFailure},
+		findResults:   [][]notifier.MessageRef{{"200.000000"}},
+	}
+	reconciler, _ := NewReconciler(destination, store)
+	if err := reconciler.Reconcile(context.Background(), presence.Snapshot{}, false); !errors.Is(err, deleteFailure) {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if !containsCall(destination.calls, "find:op") || !containsCall(destination.calls, "delete:200.000000") {
+		t.Fatalf("pending cleanup calls = %#v", destination.calls)
+	}
+	if store.state.Pending != nil || !reflect.DeepEqual(store.state.Stale, []notifier.MessageRef{"100.000000"}) {
+		t.Fatalf("pending cleanup was not persisted independently: %#v", store.state)
 	}
 }
 
@@ -331,6 +403,41 @@ func TestForcedReconciliationRepostsMissingCurrent(t *testing.T) {
 		t.Fatalf("calls = %#v", destination.calls)
 	}
 	if store.state.Current != "200.000000" || store.state.Pending != nil {
+		t.Fatalf("state = %#v", store.state)
+	}
+}
+
+func TestPersistentDeleteFailureUpdatesCurrentWithoutPostingDuplicates(t *testing.T) {
+	deleteFailure := errors.New("cant_delete_message")
+	store := &memoryStore{state: State{
+		Version: stateVersion, DestinationID: "destination-1", Current: "300.000000",
+		Stale: []notifier.MessageRef{"100.000000", "200.000000"},
+	}}
+	destination := &fakeDestination{
+		destinationID: "destination-1",
+		deleteErr:     map[string]error{"100.000000": deleteFailure},
+	}
+	reconciler, err := NewReconciler(destination, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reconciler.Reconcile(context.Background(), snapshot("Alice"), false); !errors.Is(err, deleteFailure) {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if err := reconciler.Reconcile(context.Background(), snapshot("Bob"), false); !errors.Is(err, deleteFailure) {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+
+	for _, call := range destination.calls {
+		if strings.HasPrefix(call, "post:") {
+			t.Fatalf("unexpected replacement post: calls = %#v", destination.calls)
+		}
+	}
+	if !containsCall(destination.calls, "delete:200.000000") {
+		t.Fatalf("later stale message was not cleaned: calls = %#v", destination.calls)
+	}
+	if store.state.Current != "300.000000" || !reflect.DeepEqual(store.state.Stale, []notifier.MessageRef{"100.000000"}) {
 		t.Fatalf("state = %#v", store.state)
 	}
 }

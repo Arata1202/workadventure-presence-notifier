@@ -23,6 +23,8 @@ import (
 
 var version = "dev"
 
+const minimumOnceReconciliationTimeout = 5 * time.Minute
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -167,12 +169,22 @@ func newDestination(cfg config.DestinationConfig) (configuredDestination, error)
 		}, &http.Client{Timeout: cfg.Slack.RequestTimeout})
 		return configuredDestination{
 			client: client,
-			reconciliationTimeout: slacknotifier.DefaultAttempts*cfg.Slack.RequestTimeout +
-				time.Duration(slacknotifier.DefaultAttempts-1)*slacknotifier.MaximumRetryWait,
+			reconciliationTimeout: maxDuration(
+				minimumOnceReconciliationTimeout,
+				slacknotifier.DefaultAttempts*cfg.Slack.RequestTimeout+
+					time.Duration(slacknotifier.DefaultAttempts-1)*slacknotifier.MaximumRetryWait,
+			),
 		}, err
 	default:
 		return configuredDestination{}, fmt.Errorf("unsupported destination %q", cfg.Type)
 	}
+}
+
+func maxDuration(left, right time.Duration) time.Duration {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func shutdownWasIntentional(root context.Context) bool { return root.Err() != nil }

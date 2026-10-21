@@ -32,6 +32,10 @@ The notifier reads `getRooms` and `adminRoom` from WorkAdventure over internal, 
 
 For a non-empty update, the service atomically records a random operation ID before any Slack call, marks the operation attempted, and attaches only that operation ID as Slack message metadata. If the post result is ambiguous, the next reconciliation searches channel history from five minutes before the local attempt time to tolerate clock skew. A no-match result cannot trigger a replacement during the 30-second recovery grace period. The newest matching message is unconditionally updated to the current rendered text and becomes current; duplicate matches and the previous current message become stale, and stale messages are deleted. A crash or failed deletion leaves enough non-sensitive state for recovery or cleanup to be retried. On a SIGINT or SIGTERM shutdown, deletion starts only after the coordinator has stopped and is attempted within `status.shutdown_timeout`; state is cleared only after successful deletion or Slack `message_not_found`. When rendered presence is unchanged, periodic reconciliation updates the known current message in place; if it was deleted externally, the missing reference is cleared before the normal replacement flow posts a new status. A missed presence change still uses the usual post-new-then-delete-old flow.
 
+## Upgrading from v0.1
+
+Version 0.2 is not an in-place configuration upgrade. Replace the incoming webhook with a Slack bot that can post message metadata, remove the old `notification` and `empty_message` keys, set `notifiers.slack.channel_id`, provide `SLACK_BOT_TOKEN`, and add the persistent state volume. Messages previously posted by the v0.1 webhook cannot be identified by v0.2 and must be removed manually.
+
 ## Slack app setup
 
 Create or select a Slack app and add these bot token scopes:
@@ -40,7 +44,9 @@ Create or select a Slack app and add these bot token scopes:
 - `channels:history` when the target is a public channel
 - `groups:history` when the target is a private channel
 
-Install the app, invite the bot to the target channel, and obtain the channel ID from Slack channel details. The app must remain a member of the channel so metadata recovery through `conversations.history` can work. A missing history scope or lost membership intentionally blocks replacement posts while preserving the known current status and pending recovery state.
+The notifier uses the metadata event type `workadventure_presence_status` with one string payload property named `operation_id`. Slack allows unregistered custom metadata, but registering the schema under the app manifest's top-level `events` section is recommended for validation and discoverability. The notifier treats metadata-related response warnings as errors. See Slack's [message metadata guide](https://docs.slack.dev/messaging/message-metadata/) and [app manifest reference](https://docs.slack.dev/reference/app-manifest/).
+
+Install the app, invite the bot to the target channel, and obtain the channel ID from Slack channel details. The app must remain a member of the channel so metadata recovery through `conversations.history` can work. A missing history scope, rejected metadata, or lost membership intentionally blocks replacement posts while preserving the known current status and pending recovery state.
 
 Provide the bot token only through the environment:
 
@@ -64,11 +70,19 @@ docker compose -f compose.example.yaml run --rm --build \
   --once
 ~~~
 
-The --once mode gives WorkAdventure readiness and Slack reconciliation separate deadlines, performs one Bot API reconciliation, and exits. It does not delete the resulting status on exit. Start daemon mode after validation:
+The --once mode gives WorkAdventure readiness and Slack reconciliation separate deadlines, allows at least five minutes for a complete multi-call Slack recovery, performs one reconciliation, and exits. It does not delete the resulting status on exit. Start daemon mode after validation:
 
 ~~~sh
 docker compose -f compose.example.yaml up -d --build
 ~~~
+
+For a released version, pin the published image instead of rebuilding a checkout:
+
+~~~sh
+docker pull ghcr.io/arata1202/workadventure-presence-notifier:0.2.0
+~~~
+
+Replace the Compose service's `build` section with `image: ghcr.io/arata1202/workadventure-presence-notifier:0.2.0`, or use that image in the Docker command below. Avoid floating tags when reproducible deployment matters.
 
 The Compose example mounts a named volume at /var/lib/workadventure-presence-notifier. Keep it across routine VM and container restarts. Losing it can leave an old Slack status that the service cannot identify. Its 25-second `stop_grace_period` exceeds the example's worst-case 10-second coordinator stop wait plus its 10-second Slack cleanup window, leaving Docker time to deliver SIGTERM before SIGKILL. Increase the grace period if you increase `status.shutdown_timeout`.
 
@@ -114,7 +128,9 @@ The state parent directory is created with private permissions when possible. St
 
 The version 1 file uses a destination-neutral schema containing a destination ID, opaque current and stale message references, a pending operation UUID, and a non-sensitive RFC 3339 attempt time when recovery is needed. Rendered-content hashes are process-local and are not persisted. The file contains no display names, rendered text, room data, or tokens. The design assumes a single running instance. Do not share one state file between replicas or destinations.
 
-Unknown fields, malformed identifiers, impossible invariants, and unsupported versions stop startup instead of discarding cleanup information.
+Unknown fields, additional YAML documents, malformed identifiers, impossible invariants, and unsupported versions stop startup instead of discarding cleanup information.
+
+Changing `notifiers.slack.channel_id` while tracked state exists also stops startup. To move channels safely, stop the service gracefully while the old bot and channel are still accessible, confirm that the old status was deleted, then change the channel ID and restart. If the old destination is no longer accessible, remove the orphaned Slack message manually before resetting the state file.
 
 ## Docker
 
@@ -136,13 +152,13 @@ The tested baseline is WorkAdventure v1.33.0, with end-to-end coverage also comp
 
 ## Failure behavior
 
-- WorkAdventure discovery and room subscriptions reconnect automatically.
+- WorkAdventure discovery and room subscriptions reconnect automatically. While a synchronized snapshot is unavailable, the last Slack status remains visible; an acquisition failure is never interpreted as zero users.
 - Initial synchronization is best-effort: expected user counts can complete replay early, while `initial_sync_timeout` is the fallback when the protocol cannot prove replay completeness. Rooms discovered with zero expected users wait for that timeout so racing joins are included.
 - Ambiguous `chat.postMessage` outcomes (network failure, HTTP 5xx, `fatal_error`/`internal_error`, decode failure, or a missing timestamp) are not automatically retried. HTTP 429 may be retried because Slack explicitly rejected that attempt; `Retry-After` is honored up to 30 seconds.
 - Other Slack methods use bounded retries. Slack responses are limited to 1 MiB, and history is requested in pages of 50 messages. A failed or ambiguous post leaves the previous status current and retains only the operation ID and attempt timestamp. Recovery must successfully search message metadata in channel history and wait through the 30-second visibility grace period before posting again.
 - If history lookup fails because of scope, membership, network, or API errors, the service keeps the valid previous status and pending metadata without guessing or reposting.
 - `chat.update` `message_not_found` triggers another history lookup and, only when no matching message remains, a fresh post attempt.
-- A failed old-message deletion remains recorded and is retried without posting another unchanged status.
+- A failed old-message deletion remains recorded and is retried. While stale cleanup is blocked, later presence changes update the current message in place instead of creating unbounded replacement posts; cleanup continues for other stale references.
 - message_not_found is successful idempotent deletion.
 - Reconciliation failures retry after 30 seconds with capped exponential backoff up to `status.reconciliation_interval`; a successful reconciliation or new presence change resets the backoff.
 - An intentional shutdown exits with an error if status deletion cannot complete; persisted state remains available for a later cleanup retry.

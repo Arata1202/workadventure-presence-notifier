@@ -57,6 +57,18 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsMultipleYAMLDocuments(t *testing.T) {
+	t.Setenv(SlackBotTokenEnv, "token")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("notifiers:\n  slack:\n    channel_id: C123\n---\nunknown: true\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want a multiple-document error")
+	}
+}
+
 func TestLoadRequiresSlackConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("notifiers:\n  slack:\n    channel_id: C123\n"), 0o600); err != nil {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,40 @@ const testBufferSize = 1024 * 1024
 
 type fakeRoomManager struct {
 	pb.UnimplementedRoomManagerServer
+}
+
+type reconnectingRoomManager struct {
+	pb.UnimplementedRoomManagerServer
+	streams    atomic.Int32
+	closeFirst chan struct{}
+}
+
+func (*reconnectingRoomManager) GetRooms(context.Context, *emptypb.Empty) (*pb.RoomsList, error) {
+	return &pb.RoomsList{RoomDescription: []*pb.RoomDescription{{RoomId: "room-a", NbUsers: 1}}}, nil
+}
+
+func (s *reconnectingRoomManager) AdminRoom(stream grpc.BidiStreamingServer[pb.AdminPusherToBackMessage, pb.ServerToAdminClientMessage]) error {
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	attempt := s.streams.Add(1)
+	user := &pb.UserJoinedRoomMessage{Uuid: "user-a", Name: "Alice"}
+	if attempt > 1 {
+		user = &pb.UserJoinedRoomMessage{Uuid: "user-b", Name: "Bob"}
+	}
+	if err := stream.Send(&pb.ServerToAdminClientMessage{Message: &pb.ServerToAdminClientMessage_UserJoinedRoom{UserJoinedRoom: user}}); err != nil {
+		return err
+	}
+	if attempt == 1 {
+		select {
+		case <-s.closeFirst:
+			return nil
+		case <-stream.Context().Done():
+			return nil
+		}
+	}
+	<-stream.Context().Done()
+	return nil
 }
 
 type zeroCountRoomManager struct {
@@ -126,6 +161,65 @@ func TestProviderCollectsPresence(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Run() did not stop")
+	}
+}
+
+func TestProviderReconnectsWithoutPublishingReplayZero(t *testing.T) {
+	listener := bufconn.Listen(testBufferSize)
+	manager := &reconnectingRoomManager{closeFirst: make(chan struct{})}
+	server := grpc.NewServer()
+	pb.RegisterRoomManagerServer(server, manager)
+	go func() { _ = server.Serve(listener) }()
+	defer server.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	provider := New(Options{
+		Address:               "passthrough:///bufnet",
+		RoomDiscoveryInterval: time.Hour,
+		ReconnectInterval:     10 * time.Millisecond,
+		InitialSyncTimeout:    time.Second,
+		RequestTimeout:        time.Second,
+		DialOptions: []grpc.DialOption{grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		})},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	done := make(chan error, 1)
+	go func() { done <- provider.Run(ctx) }()
+
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), time.Second)
+	defer readyCancel()
+	if err := provider.WaitReady(readyCtx); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := provider.Snapshot()
+	if err != nil || snapshot.Count() != 1 || snapshot.Users[0].Name != "Alice" {
+		t.Fatalf("initial Snapshot() = %#v, %v", snapshot, err)
+	}
+
+	close(manager.closeFirst)
+	select {
+	case <-provider.Changes():
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnected presence change was not published")
+	}
+	snapshot, err = provider.Snapshot()
+	if err != nil || snapshot.Count() != 1 || snapshot.Users[0].Name != "Bob" {
+		t.Fatalf("reconnected Snapshot() = %#v, %v", snapshot, err)
+	}
+	select {
+	case <-provider.Changes():
+		t.Fatal("reconnect replay emitted more than one change")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not stop after reconnect")
 	}
 }
 
