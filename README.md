@@ -33,7 +33,7 @@ Currently online (3): Alice, Bob, Charlie
 
 ## Slack app setup
 
-Create a Slack app with the `chat:write` bot token scope, install it to the workspace, and invite the bot to the target channel. No channel-history scope is required.
+Create a Slack app with the `chat:write` bot token scope, install it to the workspace, and invite the bot to the target channel. No event subscription, App-Level Token, channel-history scope, or Incoming Webhook is required.
 
 Keep the bot token in the environment:
 
