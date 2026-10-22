@@ -13,7 +13,7 @@ Contributions are welcome. Please keep changes focused, documented, and safe for
 
 Requirements:
 
-- Go 1.27.2 or later
+- Go 1.27.3 or later
 - Docker
 
 Clone the repository, then run:
@@ -23,13 +23,13 @@ go mod download
 go test ./...
 ~~~
 
-The Slack webhook URL must remain outside configuration files:
+The Slack bot token must remain outside configuration files:
 
 ~~~sh
-export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+export SLACK_BOT_TOKEN="xoxb-..."
 ~~~
 
-Never commit webhook URLs, tokens, production configuration, room URLs, IP addresses, or real user presence data.
+Never commit tokens, production configuration, room URLs, IP addresses, or real user presence data.
 
 ## Making changes
 

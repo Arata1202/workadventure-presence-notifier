@@ -4,19 +4,44 @@
 [![GitHub release](https://img.shields.io/github/v/release/Arata1202/workadventure-presence-notifier)](https://github.com/Arata1202/workadventure-presence-notifier/releases/latest)
 [![License](https://img.shields.io/github/license/Arata1202/workadventure-presence-notifier)](LICENSE)
 
-A small service that periodically sends the current WorkAdventure user list to external notification services.
-
-The first notifier is Slack Incoming Webhooks. The internal notifier boundary is intentionally small so additional destinations can be contributed without changing the WorkAdventure presence provider.
+A small service that maintains one event-driven Slack status for the people currently online in WorkAdventure.
 
 ## Architecture
 
-![WorkAdventure presence notification architecture](docs/architecture/workadventure-presence-notifier.png)
+![WorkAdventure presence status architecture](docs/architecture/workadventure-presence-notifier.png)
 
-The notifier reads presence data through WorkAdventure's internal gRPC API and sends scheduled summaries to Slack over HTTPS. Port `50051` remains inside the trusted Docker network. The editable source is available in [Excalidraw format](docs/architecture/workadventure-presence-notifier.excalidraw).
+The service discovers rooms and consumes presence events through WorkAdventure's internal gRPC API. It deduplicates users globally by WorkAdventure UUID, waits five seconds after the last change by default, then posts a new Slack message before deleting the previous one. Port `50051` stays inside the trusted Docker network; Slack calls use HTTPS. The editable diagram source is available in [Excalidraw format](docs/architecture/workadventure-presence-notifier.excalidraw).
 
-## Status
+Version 0.2 supports one WorkAdventure `back` service, one configured destination, and one notifier process.
 
-The latest release is [`v0.1.0`](https://github.com/Arata1202/workadventure-presence-notifier/releases/tag/v0.1.0). Multi-platform container images are available from `ghcr.io/arata1202/workadventure-presence-notifier` for Linux AMD64 and ARM64.
+## Behavior
+
+- Publishes a synchronized non-empty snapshot on startup
+- Debounces presence changes for five seconds by default
+- Posts a changed non-empty status before deleting the previous status
+- Deletes all known current and stale statuses when nobody is online
+- Deletes all known current and stale statuses on intentional daemon shutdown
+- Retains the last valid status while WorkAdventure discovery or room reconnection is incomplete
+- Persists the destination ID, current message timestamp, and up to three known stale timestamps for restart replacement and cleanup
+- Leaves a successful `--once` result in Slack for practical live validation
+
+Example status:
+
+```text
+Currently online (3): Alice, Bob, Charlie
+```
+
+## Slack app setup
+
+Create a Slack app with the `chat:write` bot token scope, install it to the workspace, and invite the bot to the target channel. No event subscription, App-Level Token, channel-history scope, or Incoming Webhook is required.
+
+Keep the bot token in the environment:
+
+```sh
+export SLACK_BOT_TOKEN="xoxb-..."
+```
+
+Never place the token in `config.yaml` or commit it.
 
 ## Quick start
 
@@ -24,7 +49,8 @@ The notifier must be able to reach the WorkAdventure `back` service on its inter
 
 ```sh
 cp config.example.yaml config.yaml
-export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+# Set destination.slack.channel_id in config.yaml.
+export SLACK_BOT_TOKEN="xoxb-..."
 export WORKADVENTURE_NETWORK="workadventure_default"
 
 docker compose -f compose.example.yaml run --rm --build \
@@ -33,58 +59,17 @@ docker compose -f compose.example.yaml run --rm --build \
   --once
 ```
 
-The command sends one real Slack notification and exits. If it succeeds, start daemon mode:
+The command publishes one real status and exits without deleting it. If it succeeds, start daemon mode:
 
 ```sh
 docker compose -f compose.example.yaml up -d --build
 ```
 
-Use `docker network ls` if the WorkAdventure network name is unknown. Never commit the Slack webhook URL.
-
-## Features
-
-- Discovers active WorkAdventure rooms through the internal gRPC API
-- Maintains the current user list from room presence streams
-- Deduplicates multiple connections by WorkAdventure UUID
-- Sends scheduled Slack notifications
-- Supports a one-shot mode for validation and cron-style execution
-- Uses YAML for behavior and message templates
-- Keeps the Slack webhook URL in an environment variable
-- Does not retain or expose IP addresses
-
-Example Slack message:
-
-```text
-Currently online (3): Alice, Bob, Charlie
-```
-
-## Compatibility
-
-The minimum supported version is WorkAdventure `v1.33.0`. End-to-end container tests have been completed against WorkAdventure `v1.33.0` and `v1.34.2`. Later releases may work when the required internal RPCs remain compatible, but untested versions are not guaranteed.
-
-The provider uses the `getRooms` and `adminRoom` RPCs shared by WorkAdventure `v1.33.x` and `v1.34.x`. The compatibility protocol intentionally defines only the fields required for presence notifications. The IP address field sent by WorkAdventure is not part of the generated Go type and is discarded while decoding.
-
-The initial implementation supports one WorkAdventure `back` service. Multiple back instances are outside the initial scope.
+The named `notifier-state` volume preserves the destination ID and known message timestamps across restarts. The Compose example gives the process 20 seconds to finish its configured 10-second shutdown cleanup. Use `docker network ls` if the WorkAdventure network name is unknown.
 
 ## Configuration
 
-Copy the example configuration:
-
-```sh
-cp config.example.yaml config.yaml
-```
-
-Configuration files use Go duration syntax such as `30s`, `5m`, and `1h`. Unknown YAML keys are rejected to catch configuration mistakes. The example file documents every currently supported setting.
-
-`workadventure.address` must point to the internal gRPC endpoint of the WorkAdventure `back` service. The default is `back:50051`.
-
-Set the Slack Incoming Webhook URL through the environment:
-
-```sh
-export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
-```
-
-Example configuration:
+Configuration files use Go duration syntax such as `30s`, `5m`, and `1h`. Unknown YAML keys are rejected.
 
 ```yaml
 workadventure:
@@ -94,86 +79,64 @@ workadventure:
   initial_sync_timeout: "2s"
   request_timeout: "10s"
 
-notification:
-  interval: "30m"
+status:
+  debounce: "5s"
+  shutdown_timeout: "10s"
+  state_file: "/var/lib/workadventure-presence-notifier/state.json"
 
-notifiers:
+destination:
   slack:
+    channel_id: "C0123456789"
     message: "Currently online ({{ .Count }}): {{ .Users }}"
-    empty_message: "No users are currently online."
     user_separator: ", "
+    request_timeout: "10s"
 ```
 
-### Template values
+Template values:
 
-- `.Count`: number of unique users
-- `.Users`: display names joined with `user_separator`
-- `.UserNames`: sorted list of display names
+- `.Count`: total number of unique online users
+- `.Users`: sorted, bounded, Slack-escaped display names joined with `user_separator`
+- `.UserNames`: the bounded sorted display-name list
 
-User names are escaped before they are inserted into Slack text.
+The service caps individual names, the rendered message, and Slack API response bodies. Requests have a configured timeout and bounded attempts. It sends plain text with Slack mrkdwn disabled, keeps `&`, `<`, and `>` escaped, and disables link and media unfurling.
 
-## Docker
+## Compatibility
 
-Build the image:
+The minimum supported version is WorkAdventure `v1.33.0`. End-to-end container tests have been completed against WorkAdventure `v1.33.0` and `v1.34.2`. Later releases may work when the required internal RPCs remain compatible, but untested versions are not guaranteed.
 
-```sh
-docker build -t workadventure-presence-notifier:dev .
-```
+The provider uses the `getRooms` and `adminRoom` RPCs. The compatibility protocol includes only the fields required for presence; WorkAdventure IP address fields are discarded while decoding.
 
-Run the container on the same Docker network as the WorkAdventure `back` service. The gRPC connection is unencrypted and is intended only for a trusted internal network; do not expose port `50051` publicly:
+## Failure behavior
 
-```sh
-docker run --rm \
-  --network workadventure_default \
-  -e SLACK_WEBHOOK_URL \
-  -v "$PWD/config.yaml:/etc/workadventure-presence-notifier/config.yaml:ro" \
-  workadventure-presence-notifier:dev \
-  --config /etc/workadventure-presence-notifier/config.yaml
-```
-
-The repository also includes `compose.example.yaml`. The container runs as the non-root UID/GID `65532:65532`, so the bind-mounted configuration file must be readable by that user. Set `WORKADVENTURE_NETWORK` when the WorkAdventure Docker network uses a different name:
-
-```sh
-WORKADVENTURE_NETWORK=workadventure_default \
-  docker compose -f compose.example.yaml up -d --build
-```
-
-Release images are published to `ghcr.io/arata1202/workadventure-presence-notifier` for Linux AMD64 and ARM64.
-
-After a release, pull a specific version instead of relying on `latest` for production deployments:
-
-```sh
-docker pull ghcr.io/arata1202/workadventure-presence-notifier:0.1.0
-```
+- Failed room discovery leaves the last valid global snapshot unchanged.
+- A reconnect builds a replacement room snapshot privately and publishes it only after synchronization.
+- A failed Slack post leaves the previous status and persisted reference unchanged.
+- A missing persisted Slack message is treated as recoverable during delete or replacement.
+- Startup stops with a clear error if persisted references belong to a different configured destination.
+- Failed deletion of a known stale message is retained and retried on startup, publish, empty-state cleanup, and shutdown. The service stops posting replacements when all three stale slots remain occupied.
+- Slack network failures after a post may be ambiguous. The service logs the failure and does not scan channel history or claim exactly-once delivery.
+- Normal logs do not include user names, room URLs, tokens, or IP addresses.
 
 ## One-shot mode
 
-One-shot mode waits for the initial WorkAdventure presence snapshot, sends one real notification, and exits with a non-zero status if configuration, presence collection, or delivery fails:
+`--once` waits for a synchronized WorkAdventure snapshot, applies the same replacement or empty cleanup behavior, and exits. It intentionally does not delete a successfully published status on normal exit:
 
 ```sh
-docker run --rm \
-  --network workadventure_default \
-  -e SLACK_WEBHOOK_URL \
-  -v "$PWD/config.yaml:/etc/workadventure-presence-notifier/config.yaml:ro" \
-  workadventure-presence-notifier:dev \
+docker compose -f compose.example.yaml run --rm --build \
+  workadventure-presence-notifier \
   --config /etc/workadventure-presence-notifier/config.yaml \
   --once
 ```
 
-Normal daemon mode does not send a startup notification. The first notification is sent after the configured interval.
+## Migrating from v0.1
 
-## Failure behavior
-
-- WorkAdventure discovery and room streams reconnect automatically.
-- A failed presence snapshot is logged and skipped until the next interval.
-- A failed Slack request is logged and retried at the next interval.
-- User display names, room URLs, webhook URLs, and IP addresses are not written to normal logs.
+Version 0.2 replaces Incoming Webhooks and interval summaries. See [the v0.2 migration guide](docs/migration-v0.2.md) for Slack scopes, environment variables, configuration, persistence, and operational changes.
 
 ## Development
 
 Requirements:
 
-- Go 1.27.2 or later
+- Go 1.27.3 or later
 - Docker, for container builds and protocol generation
 
 Run the same validation used by CI:
@@ -187,27 +150,11 @@ docker build --build-arg VERSION=ci -t workadventure-presence-notifier:ci .
 test "$(docker run --rm workadventure-presence-notifier:ci --version)" = "ci"
 ```
 
-Regenerate the minimal gRPC compatibility types:
-
-```sh
-make generate
-```
-
-Build the binary:
-
-```sh
-make build
-```
-
-## v0.1.0 scope
-
-`v0.1.0` does not include join or leave notifications, Slack Bot authentication, Block Kit messages, persistence, history, multiple WorkAdventure back instances, a management UI, health endpoints, or metrics.
+Regenerate the minimal gRPC compatibility types with `make generate` after changing `proto/workadventure.proto`.
 
 ## Contributing and security
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull request guidelines. Maintainers should follow [RELEASING.md](RELEASING.md) when publishing a version.
-
-Do not report vulnerabilities in public issues. Follow [SECURITY.md](SECURITY.md) for private reporting guidance.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [SECURITY.md](SECURITY.md) for private vulnerability reporting. Maintainers should follow [RELEASING.md](RELEASING.md) when publishing a version.
 
 ## License
 

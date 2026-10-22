@@ -68,7 +68,7 @@ body:
     id: logs
     attributes:
       label: Sanitized logs
-      description: Remove webhook URLs, tokens, user names, room URLs, IP addresses, and other sensitive data.
+      description: Remove bot tokens, user names, room URLs, IP addresses, and other sensitive data.
       render: shell
 
   - type: textarea

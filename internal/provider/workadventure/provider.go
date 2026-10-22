@@ -27,8 +27,7 @@ type Options struct {
 }
 
 type roomWorker struct {
-	cancel        context.CancelFunc
-	expectedUsers atomic.Int64
+	cancel context.CancelFunc
 }
 
 type Provider struct {
@@ -88,6 +87,10 @@ func (p *Provider) Snapshot() (presence.Snapshot, error) {
 	return p.store.snapshot()
 }
 
+func (p *Provider) Changes() <-chan struct{} {
+	return p.store.changes()
+}
+
 func (p *Provider) discover(ctx context.Context, client pb.RoomManagerClient) {
 	requestCtx, cancel := context.WithTimeout(ctx, p.options.RequestTimeout)
 	defer cancel()
@@ -95,19 +98,19 @@ func (p *Provider) discover(ctx context.Context, client pb.RoomManagerClient) {
 	rooms, err := client.GetRooms(requestCtx, &emptypb.Empty{})
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			p.logger.Warn("failed to discover WorkAdventure rooms", "error", err)
+			p.logger.Warn("failed to discover WorkAdventure rooms", "reason", safeProviderError(err))
 		}
 		return
 	}
 
 	roomIDs := make([]string, 0, len(rooms.GetRoomDescription()))
-	active := make(map[string]int, len(rooms.GetRoomDescription()))
+	active := make(map[string]struct{}, len(rooms.GetRoomDescription()))
 	for _, room := range rooms.GetRoomDescription() {
 		if room.GetRoomId() == "" {
 			continue
 		}
 		roomIDs = append(roomIDs, room.GetRoomId())
-		active[room.GetRoomId()] = int(room.GetNbUsers())
+		active[room.GetRoomId()] = struct{}{}
 	}
 
 	p.store.setRooms(roomIDs)
@@ -115,28 +118,26 @@ func (p *Provider) discover(ctx context.Context, client pb.RoomManagerClient) {
 	p.logger.Debug("discovered WorkAdventure rooms", "rooms", len(roomIDs))
 }
 
-func (p *Provider) reconcileWorkers(ctx context.Context, client pb.RoomManagerClient, active map[string]int) {
+func (p *Provider) reconcileWorkers(ctx context.Context, client pb.RoomManagerClient, active map[string]struct{}) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for roomID, worker := range p.workers {
-		if expectedUsers, ok := active[roomID]; ok {
-			worker.expectedUsers.Store(int64(expectedUsers))
+		if _, ok := active[roomID]; ok {
 			continue
 		}
 		worker.cancel()
 		delete(p.workers, roomID)
 	}
 
-	for roomID, expectedUsers := range active {
+	for roomID := range active {
 		if _, ok := p.workers[roomID]; ok {
 			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
 		worker := &roomWorker{cancel: cancel}
-		worker.expectedUsers.Store(int64(expectedUsers))
 		p.workers[roomID] = worker
-		go p.runRoom(workerCtx, client, roomID, &worker.expectedUsers)
+		go p.runRoom(workerCtx, client, roomID)
 	}
 }
 
@@ -149,14 +150,17 @@ func (p *Provider) stopWorkers() {
 	}
 }
 
-func (p *Provider) runRoom(ctx context.Context, client pb.RoomManagerClient, roomID string, expectedUsers *atomic.Int64) {
+func (p *Provider) runRoom(ctx context.Context, client pb.RoomManagerClient, roomID string) {
+	p.store.beginRoomSync(roomID)
 	for {
-		p.store.resetRoom(roomID)
-		err := p.subscribeRoom(ctx, client, roomID, expectedUsers)
+		attemptCtx, cancel := context.WithCancel(ctx)
+		err := p.subscribeRoom(attemptCtx, client, roomID)
+		cancel()
 		if ctx.Err() != nil {
 			return
 		}
-		p.logger.Warn("WorkAdventure room subscription ended", "error", err)
+		p.store.beginRoomSync(roomID)
+		p.logger.Warn("WorkAdventure room subscription ended", "reason", safeProviderError(err))
 		if !sleep(ctx, p.options.ReconnectInterval) {
 			return
 		}
@@ -168,7 +172,9 @@ type receiveResult struct {
 	err     error
 }
 
-func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClient, roomID string, expectedUsers *atomic.Int64) error {
+var errIncompleteRoomSync = errors.New("room presence synchronization incomplete")
+
+func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClient, roomID string) error {
 	stream, err := client.AdminRoom(ctx)
 	if err != nil {
 		return fmt.Errorf("open adminRoom stream: %w", err)
@@ -182,9 +188,13 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 	}
 
 	results := make(chan receiveResult, 1)
+	var receivedEvents atomic.Uint64
 	go func() {
 		for {
 			message, receiveErr := stream.Recv()
+			if receiveErr == nil {
+				receivedEvents.Add(1)
+			}
 			select {
 			case results <- receiveResult{message: message, err: receiveErr}:
 			case <-ctx.Done():
@@ -198,21 +208,46 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 
 	timer := time.NewTimer(p.options.InitialSyncTimeout)
 	defer timer.Stop()
-	ready := expectedUsers.Load() <= 0
-	if ready {
-		p.store.setRoomReady(roomID)
+	ready := false
+	validated := false
+	pending := make(map[string]userEntry)
+	commit := func() {
+		if ready {
+			return
+		}
+		ready = true
+		p.store.replaceRoom(roomID, pending)
 	}
-	joinedEvents := 0
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-timer.C:
-			if !ready {
-				ready = true
-				p.store.setRoomReady(roomID)
+			if len(results) > 0 {
+				validated = false
+				resetTimer(timer, p.options.InitialSyncTimeout)
+				continue
 			}
+			generation := receivedEvents.Load()
+			expectedUsers, err := p.roomUserCount(ctx, client, roomID)
+			if err != nil {
+				return fmt.Errorf("refresh room user count: %w", err)
+			}
+			if receivedEvents.Load() != generation || len(results) > 0 {
+				validated = false
+				resetTimer(timer, p.options.InitialSyncTimeout)
+				continue
+			}
+			if pendingConnectionCount(pending) != expectedUsers {
+				return errIncompleteRoomSync
+			}
+			if !validated {
+				validated = true
+				resetTimer(timer, validationQuietPeriod(p.options.InitialSyncTimeout))
+				continue
+			}
+			commit()
 		case result := <-results:
 			if result.err != nil {
 				if errors.Is(result.err, io.EOF) || errors.Is(result.err, context.Canceled) {
@@ -222,16 +257,106 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 			}
 			switch event := result.message.GetMessage().(type) {
 			case *pb.ServerToAdminClientMessage_UserJoinedRoom:
-				joinedEvents++
-				p.store.addUser(roomID, event.UserJoinedRoom.GetUuid(), event.UserJoinedRoom.GetName())
-				if !ready && int64(joinedEvents) >= expectedUsers.Load() {
-					ready = true
-					p.store.setRoomReady(roomID)
+				if ready {
+					p.store.addUser(roomID, event.UserJoinedRoom.GetUuid(), event.UserJoinedRoom.GetName())
+					continue
 				}
+				addPendingUser(pending, event.UserJoinedRoom.GetUuid(), event.UserJoinedRoom.GetName())
+				validated = false
+				resetTimer(timer, p.options.InitialSyncTimeout)
 			case *pb.ServerToAdminClientMessage_UserLeftRoom:
-				p.store.removeUser(roomID, event.UserLeftRoom.GetUuid())
+				if ready {
+					p.store.removeUser(roomID, event.UserLeftRoom.GetUuid())
+				} else {
+					removePendingUser(pending, event.UserLeftRoom.GetUuid())
+					validated = false
+					resetTimer(timer, p.options.InitialSyncTimeout)
+				}
 			}
 		}
+	}
+}
+
+func (p *Provider) roomUserCount(ctx context.Context, client pb.RoomManagerClient, roomID string) (int, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, p.options.RequestTimeout)
+	defer cancel()
+	rooms, err := client.GetRooms(requestCtx, &emptypb.Empty{})
+	if err != nil {
+		return 0, err
+	}
+	for _, room := range rooms.GetRoomDescription() {
+		if room.GetRoomId() == roomID {
+			return int(room.GetNbUsers()), nil
+		}
+	}
+	return 0, nil
+}
+
+func pendingConnectionCount(users map[string]userEntry) int {
+	total := 0
+	for _, user := range users {
+		total += user.count
+	}
+	return total
+}
+
+func addPendingUser(users map[string]userEntry, id, name string) {
+	if id == "" {
+		return
+	}
+	entry := users[id]
+	entry.count++
+	if name != "" {
+		entry.name = name
+	}
+	users[id] = entry
+}
+
+func removePendingUser(users map[string]userEntry, id string) {
+	entry, ok := users[id]
+	if !ok {
+		return
+	}
+	entry.count--
+	if entry.count <= 0 {
+		delete(users, id)
+		return
+	}
+	users[id] = entry
+}
+
+func validationQuietPeriod(syncTimeout time.Duration) time.Duration {
+	const maximum = 250 * time.Millisecond
+	if syncTimeout < maximum {
+		return syncTimeout
+	}
+	return maximum
+}
+
+func resetTimer(timer *time.Timer, duration time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(duration)
+}
+
+func safeProviderError(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case errors.Is(err, errIncompleteRoomSync):
+		return "incomplete_sync"
+	case errors.Is(err, io.EOF):
+		return "stream_closed"
+	default:
+		return "transport_error"
 	}
 }
 

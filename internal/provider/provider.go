@@ -11,4 +11,5 @@ type Provider interface {
 	Run(ctx context.Context) error
 	WaitReady(ctx context.Context) error
 	Snapshot() (presence.Snapshot, error)
+	Changes() <-chan struct{}
 }
