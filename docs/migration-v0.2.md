@@ -28,6 +28,5 @@ Slack status messages are sent as plain text with mrkdwn disabled. WorkAdventure
 - Presence changes are debounced for five seconds by default.
 - A changed non-empty snapshot is posted before the previous status is deleted.
 - Empty presence and an intentional daemon shutdown retry deletion of all known current and stale statuses.
-- `--once` publishes the current live status and leaves it in Slack for validation.
 
 If a network connection fails after Slack may have accepted a post, the result can be ambiguous. The service logs the failure and keeps its last known reference; it does not scan channel history or claim exactly-once delivery.

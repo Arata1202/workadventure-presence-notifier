@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,7 +31,6 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
-	once := flag.Bool("once", false, "publish one live status and exit without deleting it")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -53,6 +54,7 @@ func run() error {
 	slack, err := slacknotifier.New(slacknotifier.Config{
 		BotToken: cfg.Slack.BotToken, ChannelID: cfg.Slack.ChannelID,
 		Message: cfg.Slack.Message, UserSeparator: cfg.Slack.UserSeparator,
+		EntranceURL: cfg.WorkAdventure.EntranceURL, EntranceLabel: cfg.WorkAdventure.EntranceLabel,
 	}, &http.Client{Timeout: cfg.Slack.RequestTimeout})
 	if err != nil {
 		return err
@@ -64,27 +66,32 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	providerErrors := make(chan error, 1)
-	go func() { providerErrors <- presenceProvider.Run(ctx) }()
-
-	if *once {
-		waitTimeout := cfg.WorkAdventure.RequestTimeout + cfg.WorkAdventure.RoomDiscoveryInterval + cfg.WorkAdventure.InitialSyncTimeout + cfg.WorkAdventure.ReconnectInterval
-		waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
-		defer cancel()
-		if err := statusCoordinator.WaitReady(waitCtx); err != nil {
+	var receiverErrors <-chan error
+	if cfg.WorkAdventure.EntranceURL != "" {
+		server, failures, done, err := startInteractions(cfg.Slack.InteractionsListen, cfg.Slack.SigningSecret)
+		if err != nil {
 			return err
 		}
-		if err := statusCoordinator.PublishCurrent(ctx); err != nil {
-			return err
-		}
-		logger.Info("presence status published")
-		stop()
-		return waitForProvider(providerErrors, time.Second)
+		receiverErrors = failures
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Status.ShutdownTimeout)
+			defer cancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				_ = server.Close()
+			}
+			<-done
+		}()
 	}
+	var workers sync.WaitGroup
+	defer func() { stop(); workers.Wait() }()
+	providerErrors := make(chan error, 1)
+	workers.Add(1)
+	go func() { defer workers.Done(); providerErrors <- presenceProvider.Run(ctx) }()
 
 	logger.Info("presence notifier started", "debounce", cfg.Status.Debounce)
 	coordinatorErrors := make(chan error, 1)
-	go func() { coordinatorErrors <- statusCoordinator.Run(ctx) }()
+	workers.Add(1)
+	go func() { defer workers.Done(); coordinatorErrors <- statusCoordinator.Run(ctx) }()
 	cleanup := func() error {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cfg.Status.ShutdownTimeout)
 		defer cancel()
@@ -94,33 +101,49 @@ func run() error {
 		return nil
 	}
 
+	var runErr error
+	clearStatus := false
 	select {
 	case <-ctx.Done():
-		return cleanup()
-	case err := <-providerErrors:
-		if ctx.Err() != nil {
-			return cleanup()
-		}
-		if err == nil || errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
-	case err := <-coordinatorErrors:
-		if ctx.Err() != nil {
-			return cleanup()
-		}
-		return err
+		clearStatus = true
+	case runErr = <-providerErrors:
+	case runErr = <-coordinatorErrors:
+	case runErr = <-receiverErrors:
+		clearStatus = true
 	}
+	clearStatus = clearStatus || ctx.Err() != nil
+	stop()
+	workers.Wait()
+	if errors.Is(runErr, context.Canceled) {
+		runErr = nil
+	}
+	if clearStatus {
+		return errors.Join(runErr, cleanup())
+	}
+	return runErr
 }
 
-func waitForProvider(providerErrors <-chan error, timeout time.Duration) error {
-	select {
-	case err := <-providerErrors:
-		if err == nil || errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
-	case <-time.After(timeout):
-		return nil
+// Bind synchronously so no status is published if the receiver cannot start.
+func startInteractions(address, secret string) (*http.Server, <-chan error, <-chan struct{}, error) {
+	handler, err := slacknotifier.NewInteractionHandler(secret)
+	if err != nil {
+		return nil, nil, nil, err
 	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, nil, nil, errors.New("start Slack interaction receiver: cannot bind destination.slack.interactions_listen")
+	}
+	server := &http.Server{
+		Addr: listener.Addr().String(), Handler: handler, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 2 * time.Second,
+		WriteTimeout: 2 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10,
+	}
+	failures := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			failures <- errors.New("Slack interaction receiver stopped unexpectedly")
+		}
+	}()
+	return server, failures, done, nil
 }
