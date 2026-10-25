@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -147,6 +148,12 @@ func (f fileConfig) toConfig() (Config, error) {
 			strings.ContainsFunc(cfg.WorkAdventure.EntranceURL, unicode.IsSpace) ||
 			utf8.RuneCountInString(cfg.WorkAdventure.EntranceURL) > 3000 {
 			return Config{}, errors.New("workadventure.entrance_url must be an absolute HTTP(S) URL without credentials or whitespace, at most 3000 characters")
+		}
+		if port := entrance.Port(); port != "" {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 {
+				return Config{}, errors.New("workadventure.entrance_url port must be between 1 and 65535")
+			}
 		}
 		if strings.TrimSpace(cfg.WorkAdventure.EntranceLabel) == "" || utf8.RuneCountInString(cfg.WorkAdventure.EntranceLabel) > 75 {
 			return Config{}, errors.New("workadventure.entrance_label must contain 1 to 75 characters")
