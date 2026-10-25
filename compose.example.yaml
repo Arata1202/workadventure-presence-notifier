@@ -6,11 +6,7 @@ services:
     stop_grace_period: 20s
     environment:
       SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
-      # Uncomment when workadventure.entrance_url is configured.
-      # SLACK_SIGNING_SECRET: "${SLACK_SIGNING_SECRET:?Set SLACK_SIGNING_SECRET}"
-      # Set destination.slack.interactions_listen to "0.0.0.0:8080" in config.yaml.
-      # Route /slack/interactions through an HTTPS proxy on a shared Docker network.
-      # Do not publish the listener directly; see README HTTP interaction setup.
+      SLACK_SIGNING_SECRET: "${SLACK_SIGNING_SECRET:-}"
     volumes:
       - ./config.yaml:/etc/workadventure-presence-notifier/config.yaml:ro
       - notifier-state:/var/lib/workadventure-presence-notifier

@@ -48,9 +48,8 @@ The notifier must be able to reach the WorkAdventure `back` service on its inter
 
 ```sh
 cp config.example.yaml config.yaml
-# Set destination.slack.channel_id in config.yaml.
-export SLACK_BOT_TOKEN="xoxb-..."
-export WORKADVENTURE_NETWORK="workadventure_default"
+cp .env.example .env
+# Set destination.slack.channel_id in config.yaml and fill in .env.
 
 docker compose -f compose.example.yaml up -d --build
 ```
@@ -142,10 +141,10 @@ The default listener is loopback, not publicly bound. In Docker, a proxy in a
 separate container cannot reach the notifier's loopback: explicitly set
 `interactions_listen: "0.0.0.0:8080"` inside the notifier container and route the
 proxy to `http://workadventure-presence-notifier:8080/slack/interactions` over a
-trusted shared Docker network. Pass `SLACK_SIGNING_SECRET` into the notifier's
-environment as well; the text-only Compose example does not pass it or publish
-ports. Do not publish the listener directly to the internet. Use an exact-path
-proxy rule rather than redirecting WorkAdventure's other routes to the notifier.
+trusted shared Docker network. Set `SLACK_SIGNING_SECRET` in `.env`; the Compose
+example forwards it to the notifier and does not publish ports. Do not publish
+the listener directly to the internet. Use an exact-path proxy rule rather than
+redirecting WorkAdventure's other routes to the notifier.
 
 Slack must reach this one route without interactive login/SSO middleware. Keep
 WorkAdventure's own authentication unchanged: the callback authenticates Slack
