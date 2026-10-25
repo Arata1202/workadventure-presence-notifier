@@ -130,8 +130,11 @@ Before enabling the button in a deployment:
    `https://office.example.invalid/slack/interactions` forwards to
    `http://127.0.0.1:8080/slack/interactions` when proxy and notifier share a host
    network namespace. TLS terminates at the proxy; the notifier does not serve TLS.
-3. In the same Slack app's **Interactivity & Shortcuts**, enable **Interactivity**
-   and save that HTTPS URL as the **Request URL**. Leave Options Load URL unused.
+3. In the same Slack app's **Socket Mode** settings, turn **Enable Socket Mode**
+   off so Slack uses HTTP instead of WebSocket delivery. If another integration
+   uses Socket Mode on this app, coordinate the switch or use a separate Slack app.
+   Then open **Interactivity & Shortcuts**, enable **Interactivity**, and save that
+   HTTPS URL as the **Request URL**. Leave Options Load URL unused.
    No Events API subscription, challenge handler, Socket Mode, App-Level Token,
    or additional bot scope is needed for this button.
 4. Start daemon mode and check a real click after deploying. Configuring the URL

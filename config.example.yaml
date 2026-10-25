@@ -16,7 +16,7 @@ status:
 destination:
   slack:
     # Only used when entrance_url is set; see README for container proxy routing.
-    # interactions_listen: "127.0.0.1:8080"
+    # interactions_listen: "0.0.0.0:8080"
     channel_id: "C0123456789"
     message: "Currently online ({{ .Count }}): {{ .Users }}"
     user_separator: ", "

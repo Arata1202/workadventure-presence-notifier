@@ -124,16 +124,11 @@ func TestPostEntrance(t *testing.T) {
 	for _, label := range []string{"", "Enter office"} {
 		t.Run(label, func(t *testing.T) {
 			var got postPayload
-			var raw map[string]json.RawMessage
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				if request.URL.Path != "/chat.postMessage" {
 					t.Errorf("path = %s", request.URL.Path)
 				}
-				if err := json.NewDecoder(request.Body).Decode(&raw); err != nil {
-					t.Error(err)
-				}
-				body, _ := json.Marshal(raw)
-				if err := json.Unmarshal(body, &got); err != nil {
+				if err := json.NewDecoder(request.Body).Decode(&got); err != nil {
 					t.Error(err)
 				}
 				_, _ = writer.Write([]byte(`{"ok":true,"ts":"123.456"}`))
