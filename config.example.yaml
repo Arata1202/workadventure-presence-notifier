@@ -1,5 +1,8 @@
 workadventure:
   address: "back:50051"
+  # Optional button: requires SLACK_SIGNING_SECRET and an HTTPS proxy callback route.
+  # entrance_url: "https://office.example.invalid/entrance"
+  # entrance_label: "Open WorkAdventure"
   room_discovery_interval: "30s"
   reconnect_interval: "5s"
   initial_sync_timeout: "2s"
@@ -12,6 +15,8 @@ status:
 
 destination:
   slack:
+    # Only used when entrance_url is set; see README for container proxy routing.
+    # interactions_listen: "127.0.0.1:8080"
     channel_id: "C0123456789"
     message: "Currently online ({{ .Count }}): {{ .Users }}"
     user_separator: ", "

@@ -33,7 +33,7 @@ Currently online (3): Alice, Bob, Charlie
 
 ## Slack app setup
 
-Create a Slack app with the `chat:write` bot token scope, install it to the workspace, and invite the bot to the target channel. No event subscription, App-Level Token, channel-history scope, or Incoming Webhook is required.
+Create a Slack app with the `chat:write` bot token scope, install it to the workspace, and invite the bot to the target channel. For the existing text-only status, no event subscription, App-Level Token, channel-history scope, or Incoming Webhook is required.
 
 Keep the bot token in the environment:
 
@@ -99,6 +99,86 @@ Template values:
 - `.UserNames`: the bounded sorted display-name list
 
 The service caps individual names, the rendered message, and Slack API response bodies. Requests have a configured timeout and bounded attempts. It sends plain text with Slack mrkdwn disabled, keeps `&`, `<`, and `>` escaped, and disables link and media unfurling.
+
+## Office entrance button
+
+Set a fixed office entrance URL to add a button below the presence text:
+
+```yaml
+workadventure:
+  entrance_url: "https://office.example.invalid/entrance"
+  entrance_label: "Open WorkAdventure" # optional default
+
+destination:
+  slack:
+    # Other Slack settings are unchanged.
+    interactions_listen: "127.0.0.1:8080" # default, only used with entrance_url
+```
+
+The URL is not a user-specific room or template. It must be an absolute HTTP(S)
+URL without credentials, whitespace, or backslashes, at most 3000 characters.
+Labels must contain non-whitespace text and be at most 75 characters. HTTPS is
+recommended. Keep real office URLs and access secrets out of committed examples.
+Omit `entrance_url` to retain the text-only payload, with no listener or signing
+secret required. This feature requires daemon mode: `--once` is rejected when a
+button is configured because it would leave a button without a running receiver.
+
+The message uses plain-text sections followed by one URL button, with the original
+`text` as its notification/accessibility fallback. Long text is split at Slack's
+3000-character section limit without changing the existing 4000-character message
+limit. Mrkdwn and link/media unfurling remain disabled.
+
+### HTTP interaction setup
+
+Slack [requires an acknowledgement even for URL buttons](https://docs.slack.dev/reference/block-kit/block-elements/button-element/).
+Before enabling the button in a deployment:
+
+1. Supply the existing Slack app's **Signing Secret** from **Basic Information**
+   through `SLACK_SIGNING_SECRET`. This is not the bot token or an App-Level Token.
+   It is required only when `entrance_url` is set; do not store it in YAML.
+2. Configure the existing HTTPS reverse proxy to forward the exact path
+   `/slack/interactions` to this notifier's HTTP listener, preserving the raw body
+   and `X-Slack-Signature` / `X-Slack-Request-Timestamp` headers. For example,
+   `https://office.example.invalid/slack/interactions` forwards to
+   `http://127.0.0.1:8080/slack/interactions` when proxy and notifier share a host
+   network namespace. TLS terminates at the proxy; the notifier does not serve TLS.
+3. In the same Slack app's **Interactivity & Shortcuts**, enable **Interactivity**
+   and save that HTTPS URL as the **Request URL**. Leave Options Load URL unused.
+   No Events API subscription, challenge handler, Socket Mode, App-Level Token,
+   or additional bot scope is needed for this button.
+4. Start daemon mode and check a real click after deploying. Configuring the URL
+   locally does not establish ingress or verify Slack reachability.
+
+The default listener is loopback, not publicly bound. In Docker, a proxy in a
+separate container cannot reach the notifier's loopback: explicitly set
+`interactions_listen: "0.0.0.0:8080"` inside the notifier container and route the
+proxy to `http://workadventure-presence-notifier:8080/slack/interactions` over a
+trusted shared Docker network. Pass `SLACK_SIGNING_SECRET` into the notifier's
+environment as well; the text-only Compose example does not pass it or publish
+ports. Do not publish the listener directly to the internet. Use an exact-path
+proxy rule rather than redirecting WorkAdventure's other routes to the notifier.
+
+Slack must reach this one route without interactive login/SSO middleware. Keep
+WorkAdventure's own authentication unchanged: the callback authenticates Slack
+requests, and does not authenticate users into the office or bypass office login.
+Avoid request-body/header logging at the proxy because interaction payloads can
+contain personal data and response URLs.
+
+The receiver follows Slack's [request-signing contract](https://docs.slack.dev/authentication/verifying-requests-from-slack/):
+HMAC-SHA256 over `v0:timestamp:raw_body`, constant-time signature comparison, and
+a five-minute timestamp window (keep the host clock synchronized). It accepts only
+POST requests to `/slack/interactions`, bounded to 1 MiB, with a form-encoded
+`block_actions` payload containing the `open_workadventure` button action. It
+returns an empty HTTP 200 without network calls or business actions, within
+Slack's [three-second acknowledgement deadline](https://docs.slack.dev/interactivity/handling-user-interaction/).
+Retries within the timestamp window receive the same harmless acknowledgement;
+there is no per-request replay cache. Payloads and secrets are not logged.
+Listener bind failures stop startup before publishing; receiver failures stop the
+daemon and trigger normal status cleanup. The listener shuts down with the daemon.
+
+Local tests cover signed callbacks and lifecycle with mocked requests. Live Slack
+rendering/clicks, public HTTPS routing, and reverse-proxy authentication settings
+must be verified in the target deployment; they are not established by these tests.
 
 ## Compatibility
 

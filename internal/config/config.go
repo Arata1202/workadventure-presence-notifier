@@ -5,13 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
 
 const SlackBotTokenEnv = "SLACK_BOT_TOKEN"
+const SlackSigningSecretEnv = "SLACK_SIGNING_SECRET"
 
 type Config struct {
 	WorkAdventure WorkAdventureConfig
@@ -21,6 +26,8 @@ type Config struct {
 
 type WorkAdventureConfig struct {
 	Address               string
+	EntranceURL           string
+	EntranceLabel         string
 	RoomDiscoveryInterval time.Duration
 	ReconnectInterval     time.Duration
 	InitialSyncTimeout    time.Duration
@@ -34,11 +41,13 @@ type StatusConfig struct {
 }
 
 type SlackConfig struct {
-	BotToken       string
-	ChannelID      string
-	Message        string
-	UserSeparator  string
-	RequestTimeout time.Duration
+	SigningSecret      string
+	InteractionsListen string
+	BotToken           string
+	ChannelID          string
+	Message            string
+	UserSeparator      string
+	RequestTimeout     time.Duration
 }
 
 type fileConfig struct {
@@ -49,6 +58,8 @@ type fileConfig struct {
 
 type fileWorkAdventure struct {
 	Address               string `yaml:"address"`
+	EntranceURL           string `yaml:"entrance_url"`
+	EntranceLabel         string `yaml:"entrance_label"`
 	RoomDiscoveryInterval string `yaml:"room_discovery_interval"`
 	ReconnectInterval     string `yaml:"reconnect_interval"`
 	InitialSyncTimeout    string `yaml:"initial_sync_timeout"`
@@ -66,10 +77,11 @@ type fileDestination struct {
 }
 
 type fileSlack struct {
-	ChannelID      string `yaml:"channel_id"`
-	Message        string `yaml:"message"`
-	UserSeparator  string `yaml:"user_separator"`
-	RequestTimeout string `yaml:"request_timeout"`
+	InteractionsListen string `yaml:"interactions_listen"`
+	ChannelID          string `yaml:"channel_id"`
+	Message            string `yaml:"message"`
+	UserSeparator      string `yaml:"user_separator"`
+	RequestTimeout     string `yaml:"request_timeout"`
 }
 
 func Load(path string) (Config, error) {
@@ -98,6 +110,12 @@ func Load(path string) (Config, error) {
 	if cfg.Slack.BotToken == "" {
 		return Config{}, fmt.Errorf("%s is required", SlackBotTokenEnv)
 	}
+	if cfg.WorkAdventure.EntranceURL != "" {
+		cfg.Slack.SigningSecret = os.Getenv(SlackSigningSecretEnv)
+		if strings.TrimSpace(cfg.Slack.SigningSecret) == "" {
+			return Config{}, fmt.Errorf("%s is required when workadventure.entrance_url is configured", SlackSigningSecretEnv)
+		}
+	}
 	return cfg, nil
 }
 
@@ -105,6 +123,8 @@ func (f fileConfig) toConfig() (Config, error) {
 	cfg := Config{
 		WorkAdventure: WorkAdventureConfig{
 			Address: defaultString(f.WorkAdventure.Address, "back:50051"), RoomDiscoveryInterval: 30 * time.Second,
+			EntranceURL:       f.WorkAdventure.EntranceURL,
+			EntranceLabel:     defaultString(f.WorkAdventure.EntranceLabel, "Open WorkAdventure"),
 			ReconnectInterval: 5 * time.Second, InitialSyncTimeout: 2 * time.Second, RequestTimeout: 10 * time.Second,
 		},
 		Status: StatusConfig{
@@ -112,10 +132,25 @@ func (f fileConfig) toConfig() (Config, error) {
 			StateFile: defaultString(f.Status.StateFile, "/var/lib/workadventure-presence-notifier/state.json"),
 		},
 		Slack: SlackConfig{
-			ChannelID:     f.Destination.Slack.ChannelID,
-			Message:       defaultString(f.Destination.Slack.Message, "Currently online ({{ .Count }}): {{ .Users }}"),
-			UserSeparator: defaultString(f.Destination.Slack.UserSeparator, ", "), RequestTimeout: 10 * time.Second,
+			InteractionsListen: defaultString(f.Destination.Slack.InteractionsListen, "127.0.0.1:8080"),
+			ChannelID:          f.Destination.Slack.ChannelID,
+			Message:            defaultString(f.Destination.Slack.Message, "Currently online ({{ .Count }}): {{ .Users }}"),
+			UserSeparator:      defaultString(f.Destination.Slack.UserSeparator, ", "), RequestTimeout: 10 * time.Second,
 		},
+	}
+	if cfg.WorkAdventure.EntranceURL != "" {
+		entrance, err := url.Parse(cfg.WorkAdventure.EntranceURL)
+		if err != nil || entrance == nil ||
+			(entrance.Scheme != "https" && entrance.Scheme != "http") ||
+			entrance.Hostname() == "" || entrance.User != nil ||
+			strings.ContainsAny(cfg.WorkAdventure.EntranceURL, "\\") ||
+			strings.ContainsFunc(cfg.WorkAdventure.EntranceURL, unicode.IsSpace) ||
+			utf8.RuneCountInString(cfg.WorkAdventure.EntranceURL) > 3000 {
+			return Config{}, errors.New("workadventure.entrance_url must be an absolute HTTP(S) URL without credentials or whitespace, at most 3000 characters")
+		}
+		if strings.TrimSpace(cfg.WorkAdventure.EntranceLabel) == "" || utf8.RuneCountInString(cfg.WorkAdventure.EntranceLabel) > 75 {
+			return Config{}, errors.New("workadventure.entrance_label must contain 1 to 75 characters")
+		}
 	}
 	var err error
 	for _, duration := range []struct {

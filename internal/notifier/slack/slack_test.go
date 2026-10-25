@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Arata1202/workadventure-presence-notifier/internal/notifier"
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
@@ -47,7 +48,7 @@ func TestPostAndDelete(t *testing.T) {
 			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 				t.Fatal(err)
 			}
-			if payload.Channel != "C123" || payload.Text != "*hello*" || payload.Mrkdwn || payload.UnfurlLinks || payload.UnfurlMedia {
+			if payload.Channel != "C123" || payload.Text != "*hello*" || payload.Mrkdwn || payload.UnfurlLinks || payload.UnfurlMedia || len(payload.Blocks) != 0 {
 				t.Fatalf("post payload = %#v", payload)
 			}
 			_, _ = writer.Write([]byte(`{"ok":true,"ts":"123.456"}`))
@@ -117,4 +118,88 @@ func newTestClient(t *testing.T, baseURL string) *Client {
 		t.Fatal(err)
 	}
 	return client
+}
+
+func TestPostEntrance(t *testing.T) {
+	for _, label := range []string{"", "Enter office"} {
+		t.Run(label, func(t *testing.T) {
+			var got postPayload
+			var raw map[string]json.RawMessage
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != "/chat.postMessage" {
+					t.Errorf("path = %s", request.URL.Path)
+				}
+				if err := json.NewDecoder(request.Body).Decode(&raw); err != nil {
+					t.Error(err)
+				}
+				body, _ := json.Marshal(raw)
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Error(err)
+				}
+				_, _ = writer.Write([]byte(`{"ok":true,"ts":"123.456"}`))
+			}))
+			defer server.Close()
+			client, err := New(Config{BotToken: "xoxb-test", ChannelID: "C123", Message: "{{ .Users }}", EntranceURL: "https://office.example.invalid/entrance", EntranceLabel: label, APIBaseURL: server.URL}, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := "*hello* &amp; &lt;@everyone&gt; :wave:"
+			if _, err := client.Post(context.Background(), text); err != nil {
+				t.Fatal(err)
+			}
+			if got.Text != text || got.Mrkdwn || got.UnfurlLinks || got.UnfurlMedia {
+				t.Fatalf("fallback = %#v", got)
+			}
+			if len(got.Blocks) != 2 {
+				t.Fatalf("blocks = %#v", got.Blocks)
+			}
+			body, actions := got.Blocks[0], got.Blocks[1]
+			if body.Type != "section" || body.Text == nil || body.Text.Type != "plain_text" || body.Text.Text != text || body.Text.Emoji {
+				t.Fatalf("body = %#v", body)
+			}
+			if actions.Type != "actions" || len(actions.Elements) != 1 {
+				t.Fatalf("actions = %#v", actions)
+			}
+			button := actions.Elements[0]
+			if label == "" {
+				label = "Open WorkAdventure"
+			}
+			if button.Type != "button" || button.URL != "https://office.example.invalid/entrance" || button.ActionID != "open_workadventure" || button.Text.Type != "plain_text" || button.Text.Text != label {
+				t.Fatalf("button = %#v", button)
+			}
+		})
+	}
+}
+
+func TestPostEntrancePreservesLongUnicodeMessage(t *testing.T) {
+	var got postPayload
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&got); err != nil {
+			t.Error(err)
+		}
+		_, _ = writer.Write([]byte(`{"ok":true,"ts":"123.456"}`))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL)
+	client.entranceURL = "https://office.example.invalid/"
+	text := strings.Repeat("人", 2998) + "&amp;" + strings.Repeat("人", 900)
+	if _, err := client.Post(context.Background(), text); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Blocks) != 3 {
+		t.Fatalf("blocks = %d", len(got.Blocks))
+	}
+	var joined string
+	for _, block := range got.Blocks[:2] {
+		if block.Type != "section" || block.Text == nil || utf8.RuneCountInString(block.Text.Text) > maxSectionRunes || !utf8.ValidString(block.Text.Text) {
+			t.Fatalf("invalid section = %#v", block)
+		}
+		joined += block.Text.Text
+	}
+	if joined != text || got.Text != text {
+		t.Fatal("message changed when adding entrance")
+	}
+	if got.Blocks[1].Text.Text[:5] != "&amp;" {
+		t.Fatal("escaped entity split across sections")
+	}
 }

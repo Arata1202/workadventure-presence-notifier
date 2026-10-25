@@ -24,6 +24,7 @@ const (
 	defaultAttempts   = 3
 	maxResponseSize   = 1 << 20
 	maxMessageRunes   = 4000
+	maxSectionRunes   = 3000
 	maxNameRunes      = 80
 	maxNames          = 100
 )
@@ -33,6 +34,8 @@ type Config struct {
 	ChannelID     string
 	Message       string
 	UserSeparator string
+	EntranceURL   string
+	EntranceLabel string
 	APIBaseURL    string
 	MaxAttempts   int
 	MaxRetryWait  time.Duration
@@ -43,6 +46,8 @@ type Client struct {
 	channelID     string
 	message       *template.Template
 	userSeparator string
+	entranceURL   string
+	entranceLabel string
 	baseURL       string
 	httpClient    *http.Client
 	maxAttempts   int
@@ -56,11 +61,32 @@ type templateData struct {
 }
 
 type postPayload struct {
-	Channel     string `json:"channel"`
-	Text        string `json:"text"`
-	Mrkdwn      bool   `json:"mrkdwn"`
-	UnfurlLinks bool   `json:"unfurl_links"`
-	UnfurlMedia bool   `json:"unfurl_media"`
+	Channel     string  `json:"channel"`
+	Text        string  `json:"text"`
+	Mrkdwn      bool    `json:"mrkdwn"`
+	UnfurlLinks bool    `json:"unfurl_links"`
+	UnfurlMedia bool    `json:"unfurl_media"`
+	Blocks      []block `json:"blocks,omitempty"`
+}
+
+// Slack wire types stay inside this adapter; the notifier interface remains text-based.
+type block struct {
+	Type     string           `json:"type"`
+	Text     *textObject      `json:"text,omitempty"`
+	Elements []entranceButton `json:"elements,omitempty"`
+}
+
+type textObject struct {
+	Type  string `json:"type"`
+	Text  string `json:"text"`
+	Emoji bool   `json:"emoji"`
+}
+
+type entranceButton struct {
+	Type     string     `json:"type"`
+	Text     textObject `json:"text"`
+	URL      string     `json:"url"`
+	ActionID string     `json:"action_id"`
 }
 
 type deletePayload struct {
@@ -103,8 +129,12 @@ func New(config Config, client *http.Client) (*Client, error) {
 	if config.MaxRetryWait < 0 {
 		return nil, errors.New("Slack maximum retry wait must not be negative")
 	}
+	if config.EntranceLabel == "" {
+		config.EntranceLabel = "Open WorkAdventure"
+	}
 	return &Client{
 		token: config.BotToken, channelID: config.ChannelID, message: message,
+		entranceURL: config.EntranceURL, entranceLabel: config.EntranceLabel,
 		userSeparator: config.UserSeparator, baseURL: strings.TrimRight(config.APIBaseURL, "/") + "/",
 		httpClient: client, maxAttempts: config.MaxAttempts, maxRetryWait: config.MaxRetryWait,
 	}, nil
@@ -141,9 +171,33 @@ func (c *Client) Render(snapshot presence.Snapshot) (string, error) {
 
 func (c *Client) Post(ctx context.Context, text string) (notifier.MessageRef, error) {
 	var response apiResponse
-	err := c.call(ctx, "chat.postMessage", postPayload{
+	payload := postPayload{
 		Channel: c.channelID, Text: text, Mrkdwn: false, UnfurlLinks: false, UnfurlMedia: false,
-	}, &response, false)
+	}
+	if c.entranceURL != "" {
+		// Preserve the existing 4000-character message limit despite Slack's
+		// 3000-character limit for each section. Keep escaped entities together.
+		remaining := []rune(text)
+		for len(remaining) > 0 {
+			size := min(len(remaining), maxSectionRunes)
+			if size < len(remaining) {
+				prefix := string(remaining[:size])
+				if start := strings.LastIndex(prefix, "&"); start >= 0 && !strings.Contains(prefix[start:], ";") {
+					size = utf8.RuneCountInString(prefix[:start])
+					if size == 0 {
+						size = min(len(remaining), maxSectionRunes)
+					}
+				}
+			}
+			payload.Blocks = append(payload.Blocks, block{Type: "section", Text: &textObject{Type: "plain_text", Text: string(remaining[:size])}})
+			remaining = remaining[size:]
+		}
+		payload.Blocks = append(payload.Blocks, block{Type: "actions", Elements: []entranceButton{{
+			Type: "button", Text: textObject{Type: "plain_text", Text: c.entranceLabel},
+			URL: c.entranceURL, ActionID: entranceActionID,
+		}}})
+	}
+	err := c.call(ctx, "chat.postMessage", payload, &response, false)
 	if err != nil {
 		return "", err
 	}
