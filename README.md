@@ -23,7 +23,6 @@ Version 0.2 supports one WorkAdventure `back` service, one configured destinatio
 - Deletes all known current and stale statuses on intentional daemon shutdown
 - Retains the last valid status while WorkAdventure discovery or room reconnection is incomplete
 - Persists the destination ID, current message timestamp, and up to three known stale timestamps for restart replacement and cleanup
-- Leaves a successful `--once` result in Slack for practical live validation
 
 Example status:
 
@@ -53,15 +52,6 @@ cp config.example.yaml config.yaml
 export SLACK_BOT_TOKEN="xoxb-..."
 export WORKADVENTURE_NETWORK="workadventure_default"
 
-docker compose -f compose.example.yaml run --rm --build \
-  workadventure-presence-notifier \
-  --config /etc/workadventure-presence-notifier/config.yaml \
-  --once
-```
-
-The command publishes one real status and exits without deleting it. If it succeeds, start daemon mode:
-
-```sh
 docker compose -f compose.example.yaml up -d --build
 ```
 
@@ -120,8 +110,7 @@ URL without credentials, whitespace, or backslashes, at most 3000 characters.
 Labels must contain non-whitespace text and be at most 75 characters. HTTPS is
 recommended. Keep real office URLs and access secrets out of committed examples.
 Omit `entrance_url` to retain the text-only payload, with no listener or signing
-secret required. This feature requires daemon mode: `--once` is rejected when a
-button is configured because it would leave a button without a running receiver.
+secret required.
 
 The message uses plain-text sections followed by one URL button, with the original
 `text` as its notification/accessibility fallback. Long text is split at Slack's
@@ -196,17 +185,6 @@ The provider uses the `getRooms` and `adminRoom` RPCs. The compatibility protoco
 - Failed deletion of a known stale message is retained and retried on startup, publish, empty-state cleanup, and shutdown. The service stops posting replacements when all three stale slots remain occupied.
 - Slack network failures after a post may be ambiguous. The service logs the failure and does not scan channel history or claim exactly-once delivery.
 - Normal logs do not include user names, room URLs, tokens, or IP addresses.
-
-## One-shot mode
-
-`--once` waits for a synchronized WorkAdventure snapshot, applies the same replacement or empty cleanup behavior, and exits. It intentionally does not delete a successfully published status on normal exit:
-
-```sh
-docker compose -f compose.example.yaml run --rm --build \
-  workadventure-presence-notifier \
-  --config /etc/workadventure-presence-notifier/config.yaml \
-  --once
-```
 
 ## Migrating from v0.1
 

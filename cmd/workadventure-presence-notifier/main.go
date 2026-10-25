@@ -31,7 +31,6 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
-	once := flag.Bool("once", false, "publish one live status and exit without deleting it")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -45,11 +44,6 @@ func run() error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
-	}
-
-	// One-shot mode leaves a message behind but cannot keep its receiver alive.
-	if *once && cfg.WorkAdventure.EntranceURL != "" {
-		return errors.New("office entrance button requires daemon mode; --once cannot keep the interaction receiver running")
 	}
 
 	presenceProvider := workadventureprovider.New(workadventureprovider.Options{
@@ -93,21 +87,6 @@ func run() error {
 	providerErrors := make(chan error, 1)
 	workers.Add(1)
 	go func() { defer workers.Done(); providerErrors <- presenceProvider.Run(ctx) }()
-
-	if *once {
-		waitTimeout := cfg.WorkAdventure.RequestTimeout + cfg.WorkAdventure.RoomDiscoveryInterval + cfg.WorkAdventure.InitialSyncTimeout + cfg.WorkAdventure.ReconnectInterval
-		waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
-		defer cancel()
-		if err := statusCoordinator.WaitReady(waitCtx); err != nil {
-			return err
-		}
-		if err := statusCoordinator.PublishCurrent(ctx); err != nil {
-			return err
-		}
-		logger.Info("presence status published")
-		stop()
-		return waitForProvider(providerErrors, time.Second)
-	}
 
 	logger.Info("presence notifier started", "debounce", cfg.Status.Debounce)
 	coordinatorErrors := make(chan error, 1)
@@ -167,16 +146,4 @@ func startInteractions(address, secret string) (*http.Server, <-chan error, <-ch
 		}
 	}()
 	return server, failures, done, nil
-}
-
-func waitForProvider(providerErrors <-chan error, timeout time.Duration) error {
-	select {
-	case err := <-providerErrors:
-		if err == nil || errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
-	case <-time.After(timeout):
-		return nil
-	}
 }

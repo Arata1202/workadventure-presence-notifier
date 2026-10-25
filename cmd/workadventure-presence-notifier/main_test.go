@@ -5,10 +5,13 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"flag"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -77,5 +80,23 @@ func TestInteractionReceiverBindFailure(t *testing.T) {
 	}
 	if _, _, _, err := startInteractions("127.0.0.1:0", ""); err == nil {
 		t.Fatal("missing secret accepted")
+	}
+}
+
+func TestRunRejectsOnce(t *testing.T) {
+	if os.Getenv("TEST_REJECT_ONCE") == "1" {
+		flag.CommandLine = flag.NewFlagSet("notifier", flag.ExitOnError)
+		os.Args = []string{"notifier", "--once"}
+		_ = run()
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunRejectsOnce$")
+	cmd.Env = append(os.Environ(), "TEST_REJECT_ONCE=1")
+	output, err := cmd.CombinedOutput()
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("exit error = %v, want code 2; output: %s", err, output)
+	}
+	if !strings.Contains(string(output), "flag provided but not defined: -once") {
+		t.Fatalf("missing unknown flag error: %s", output)
 	}
 }
