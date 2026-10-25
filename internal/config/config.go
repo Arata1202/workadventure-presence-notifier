@@ -18,6 +18,8 @@ import (
 
 const SlackBotTokenEnv = "SLACK_BOT_TOKEN"
 const SlackSigningSecretEnv = "SLACK_SIGNING_SECRET"
+const WorkAdventureEntranceURLEnv = "WORKADVENTURE_ENTRANCE_URL"
+const SlackChannelIDEnv = "SLACK_CHANNEL_ID"
 
 type Config struct {
 	WorkAdventure WorkAdventureConfig
@@ -102,6 +104,12 @@ func Load(path string) (Config, error) {
 			return Config{}, errors.New("decode configuration: multiple YAML documents are not supported")
 		}
 		return Config{}, fmt.Errorf("decode configuration: %w", err)
+	}
+	if value := os.Getenv(WorkAdventureEntranceURLEnv); value != "" {
+		file.WorkAdventure.EntranceURL = value
+	}
+	if value := os.Getenv(SlackChannelIDEnv); value != "" {
+		file.Destination.Slack.ChannelID = value
 	}
 	cfg, err := file.toConfig()
 	if err != nil {

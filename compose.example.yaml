@@ -7,6 +7,8 @@ services:
     environment:
       SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
       SLACK_SIGNING_SECRET: "${SLACK_SIGNING_SECRET:-}"
+      WORKADVENTURE_ENTRANCE_URL: "${WORKADVENTURE_ENTRANCE_URL:-}"
+      SLACK_CHANNEL_ID: "${SLACK_CHANNEL_ID:-}"
     volumes:
       - ./config.yaml:/etc/workadventure-presence-notifier/config.yaml:ro
       - notifier-state:/var/lib/workadventure-presence-notifier

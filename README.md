@@ -49,7 +49,7 @@ The notifier must be able to reach the WorkAdventure `back` service on its inter
 ```sh
 cp config.example.yaml config.yaml
 cp .env.example .env
-# Set destination.slack.channel_id in config.yaml and fill in .env.
+# Fill in .env; set SLACK_CHANNEL_ID there or destination.slack.channel_id in config.yaml.
 
 docker compose -f compose.example.yaml up -d --build
 ```
@@ -59,6 +59,8 @@ The named `notifier-state` volume preserves the destination ID and known message
 ## Configuration
 
 Configuration files use Go duration syntax such as `30s`, `5m`, and `1h`. Unknown YAML keys are rejected.
+
+Nonempty `WORKADVENTURE_ENTRANCE_URL` and `SLACK_CHANNEL_ID` environment variables override `workadventure.entrance_url` and `destination.slack.channel_id` before validation. Unset or empty variables keep the YAML values; either YAML field may be omitted when its environment variable supplies the value. The same URL validation, signing-secret requirement, and required channel check apply. No other YAML fields are expanded from the environment.
 
 ```yaml
 workadventure:
@@ -108,8 +110,8 @@ The URL is not a user-specific room or template. It must be an absolute HTTP(S)
 URL without credentials, whitespace, or backslashes, at most 3000 characters.
 Labels must contain non-whitespace text and be at most 75 characters. HTTPS is
 recommended. Keep real office URLs and access secrets out of committed examples.
-Omit `entrance_url` to retain the text-only payload, with no listener or signing
-secret required.
+Omit `entrance_url` and leave `WORKADVENTURE_ENTRANCE_URL` unset or empty to
+retain the text-only payload, with no listener or signing secret required.
 
 The message uses plain-text sections followed by one URL button, with the original
 `text` as its notification/accessibility fallback. Long text is split at Slack's

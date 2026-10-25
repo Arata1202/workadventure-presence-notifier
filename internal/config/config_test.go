@@ -9,6 +9,8 @@ import (
 )
 
 func TestLoad(t *testing.T) {
+	t.Setenv("WORKADVENTURE_ENTRANCE_URL", "")
+	t.Setenv("SLACK_CHANNEL_ID", "")
 	t.Setenv(SlackBotTokenEnv, "xoxb-test")
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := []byte(`workadventure:
@@ -47,6 +49,8 @@ destination:
 }
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
+	t.Setenv("WORKADVENTURE_ENTRANCE_URL", "")
+	t.Setenv("SLACK_CHANNEL_ID", "")
 	t.Setenv(SlackBotTokenEnv, "xoxb-test")
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("unknown: true\n"), 0o600); err != nil {
@@ -58,6 +62,9 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 }
 
 func TestLoadRequiresSlackBotTokenAndChannel(t *testing.T) {
+	t.Setenv(SlackBotTokenEnv, "")
+	t.Setenv("WORKADVENTURE_ENTRANCE_URL", "")
+	t.Setenv("SLACK_CHANNEL_ID", "")
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("destination:\n  slack:\n    channel_id: C123\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -75,6 +82,8 @@ func TestLoadRequiresSlackBotTokenAndChannel(t *testing.T) {
 }
 
 func TestLoadEntrance(t *testing.T) {
+	t.Setenv("WORKADVENTURE_ENTRANCE_URL", "")
+	t.Setenv("SLACK_CHANNEL_ID", "")
 	t.Setenv(SlackSigningSecretEnv, "test-signing-secret")
 	t.Setenv(SlackBotTokenEnv, "xoxb-test")
 	for _, test := range []struct {
@@ -140,6 +149,8 @@ func TestLoadEntrance(t *testing.T) {
 }
 
 func TestExampleConfiguration(t *testing.T) {
+	t.Setenv("WORKADVENTURE_ENTRANCE_URL", "")
+	t.Setenv("SLACK_CHANNEL_ID", "")
 	t.Setenv(SlackBotTokenEnv, "xoxb-test")
 	cfg, err := Load("../../config.example.yaml")
 	if err != nil {
@@ -151,6 +162,8 @@ func TestExampleConfiguration(t *testing.T) {
 }
 
 func TestEntranceSigningSecret(t *testing.T) {
+	t.Setenv("WORKADVENTURE_ENTRANCE_URL", "")
+	t.Setenv("SLACK_CHANNEL_ID", "")
 	t.Setenv(SlackBotTokenEnv, "xoxb-test")
 	t.Setenv(SlackSigningSecretEnv, "")
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -176,5 +189,71 @@ func TestEntranceSigningSecret(t *testing.T) {
 	cfg, err = Load(path)
 	if err != nil || cfg.Slack.SigningSecret != "test-only-secret" {
 		t.Fatal("signing secret not loaded")
+	}
+}
+
+func TestLoadEnvironmentOverrides(t *testing.T) {
+	for _, test := range []struct {
+		name, yaml, entrance, channel        string
+		unset                                bool
+		wantEntrance, wantChannel, wantError string
+	}{
+		{name: "precedence", yaml: "workadventure:\n  entrance_url: /invalid-yaml\ndestination:\n  slack:\n    channel_id: CYAML\n", entrance: "https://office.example.invalid/env", channel: "CENV", wantEntrance: "https://office.example.invalid/env", wantChannel: "CENV"},
+		{name: "env only", yaml: "{}\n", entrance: "https://office.example.invalid/env", channel: "CENV", wantEntrance: "https://office.example.invalid/env", wantChannel: "CENV"},
+		{name: "empty fallback", yaml: "workadventure:\n  entrance_url: https://office.example.invalid/yaml\ndestination:\n  slack:\n    channel_id: CYAML\n", wantEntrance: "https://office.example.invalid/yaml", wantChannel: "CYAML"},
+		{name: "unset fallback", yaml: "workadventure:\n  entrance_url: https://office.example.invalid/yaml\ndestination:\n  slack:\n    channel_id: CYAML\n", unset: true, wantEntrance: "https://office.example.invalid/yaml", wantChannel: "CYAML"},
+		{name: "invalid env", yaml: "workadventure:\n  entrance_url: https://office.example.invalid/yaml\n", entrance: "https://private.example.invalid:65536/", channel: "CENV", wantError: "workadventure.entrance_url"},
+		{name: "missing channel", yaml: "{}\n", wantError: "destination.slack.channel_id is required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(SlackBotTokenEnv, "xoxb-test")
+			t.Setenv(SlackSigningSecretEnv, "test-signing-secret")
+			t.Setenv("WORKADVENTURE_ENTRANCE_URL", test.entrance)
+			t.Setenv("SLACK_CHANNEL_ID", test.channel)
+			if test.unset {
+				if err := os.Unsetenv("WORKADVENTURE_ENTRANCE_URL"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Unsetenv("SLACK_CHANNEL_ID"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(test.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("Load() error = %v", err)
+				}
+				for _, value := range []string{test.entrance, test.channel} {
+					if value != "" && strings.Contains(err.Error(), value) {
+						t.Fatal("configuration error includes environment value")
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.WorkAdventure.EntranceURL != test.wantEntrance || cfg.Slack.ChannelID != test.wantChannel {
+				t.Fatal("environment precedence mismatch")
+			}
+		})
+	}
+}
+
+func TestEnvironmentEntranceRequiresSigningSecret(t *testing.T) {
+	t.Setenv(SlackBotTokenEnv, "xoxb-test")
+	t.Setenv(SlackSigningSecretEnv, "")
+	t.Setenv("WORKADVENTURE_ENTRANCE_URL", "https://office.example.invalid/env")
+	t.Setenv("SLACK_CHANNEL_ID", "CENV")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), SlackSigningSecretEnv) {
+		t.Fatal("environment entrance accepted without signing secret")
 	}
 }
