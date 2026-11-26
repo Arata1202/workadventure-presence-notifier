@@ -261,8 +261,24 @@ func (*churnRoomManager) AdminRoom(stream grpc.BidiStreamingServer[pb.AdminPushe
 			return err
 		}
 	}
-	<-stream.Context().Done()
-	return nil
+	// A second connection for Bob churns more frequently than the quiet period.
+	// The global user list remains stable, and initial sync must still finish.
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	leaveBob := &pb.ServerToAdminClientMessage{Message: &pb.ServerToAdminClientMessage_UserLeftRoom{UserLeftRoom: &pb.UserLeftRoomMessage{Uuid: "user-b"}}}
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-ticker.C:
+			if err := stream.Send(events[2]); err != nil {
+				return err
+			}
+			if err := stream.Send(leaveBob); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func TestProviderSynchronizesCurrentConnectionsAfterInitialChurn(t *testing.T) {

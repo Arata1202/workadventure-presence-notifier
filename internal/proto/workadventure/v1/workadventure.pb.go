@@ -369,10 +369,10 @@ const file_workadventure_proto_rawDesc = "" +
 	"\x13workadventure.proto\x1a\x1bgoogle/protobuf/empty.proto\"Q\n" +
 	"\x18AdminPusherToBackMessage\x12*\n" +
 	"\x0fsubscribeToRoom\x18\x01 \x01(\tH\x00R\x0fsubscribeToRoomB\t\n" +
-	"\amessage\"E\n" +
+	"\amessage\"P\n" +
 	"\x15UserJoinedRoomMessage\x12\x12\n" +
 	"\x04uuid\x18\x01 \x01(\tR\x04uuid\x12\x12\n" +
-	"\x04name\x18\x03 \x01(\tR\x04nameJ\x04\b\x02\x10\x03\")\n" +
+	"\x04name\x18\x03 \x01(\tR\x04nameJ\x04\b\x02\x10\x03R\tipAddress\")\n" +
 	"\x13UserLeftRoomMessage\x12\x12\n" +
 	"\x04uuid\x18\x01 \x01(\tR\x04uuid\"\xa5\x01\n" +
 	"\x1aServerToAdminClientMessage\x12@\n" +

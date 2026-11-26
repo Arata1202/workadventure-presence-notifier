@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -116,7 +117,7 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.Slack.BotToken = os.Getenv(SlackBotTokenEnv)
-	if cfg.Slack.BotToken == "" {
+	if strings.TrimSpace(cfg.Slack.BotToken) == "" {
 		return Config{}, fmt.Errorf("%s is required", SlackBotTokenEnv)
 	}
 	if cfg.WorkAdventure.EntranceURL != "" {
@@ -157,6 +158,14 @@ func (f fileConfig) toConfig() (Config, error) {
 			utf8.RuneCountInString(cfg.WorkAdventure.EntranceURL) > 3000 {
 			return Config{}, errors.New("workadventure.entrance_url must be an absolute HTTP(S) URL without credentials or whitespace, at most 3000 characters")
 		}
+		host := entrance.Hostname()
+		if strings.HasPrefix(entrance.Host, "[") {
+			if addr, err := netip.ParseAddr(host); err != nil || !addr.Is6() {
+				return Config{}, errors.New("workadventure.entrance_url has an invalid IPv6 host")
+			}
+		} else if strings.ContainsAny(host, ":[]") {
+			return Config{}, errors.New("workadventure.entrance_url has an invalid host")
+		}
 		if port := entrance.Port(); port != "" {
 			number, err := strconv.Atoi(port)
 			if err != nil || number < 1 || number > 65535 {
@@ -191,7 +200,7 @@ func (f fileConfig) toConfig() (Config, error) {
 	if cfg.Status.StateFile == "" {
 		return Config{}, errors.New("status.state_file is required")
 	}
-	if cfg.Slack.ChannelID == "" {
+	if strings.TrimSpace(cfg.Slack.ChannelID) == "" {
 		return Config{}, errors.New("destination.slack.channel_id is required")
 	}
 	if cfg.Slack.Message == "" {

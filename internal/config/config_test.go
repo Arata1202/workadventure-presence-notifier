@@ -112,6 +112,8 @@ func TestLoadEntrance(t *testing.T) {
 		{name: "minimum port", url: "https://office.example.invalid:1/", wantLabel: "Open WorkAdventure"},
 		{name: "maximum port", url: "https://office.example.invalid:65535/", wantLabel: "Open WorkAdventure"},
 		{name: "https port", url: "https://office.example.invalid:443/", wantLabel: "Open WorkAdventure"},
+		{name: "multiple ports", url: "https://office.example.invalid:443:8443/", wantError: true},
+		{name: "bracketed domain", url: "https://[office.example.invalid]/", wantError: true},
 		{name: "empty port", url: "https://office.example.invalid:/", wantLabel: "Open WorkAdventure"},
 		{name: "IPv6 port", url: "https://[::1]:8443/", wantLabel: "Open WorkAdventure"},
 		{name: "IPv6 port above maximum", url: "https://[::1]:65536/", wantError: true},

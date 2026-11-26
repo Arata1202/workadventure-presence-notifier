@@ -14,14 +14,15 @@ import (
 )
 
 type Coordinator struct {
-	mu            sync.Mutex
-	debounce      time.Duration
-	provider      provider.Provider
-	status        notifier.Status
-	state         *stateFile
-	known         persistedState
-	destinationID string
-	logger        *slog.Logger
+	mu             sync.Mutex
+	debounce       time.Duration
+	provider       provider.Provider
+	status         notifier.Status
+	state          *stateFile
+	known          persistedState
+	destinationID  string
+	retryNotBefore time.Time
+	logger         *slog.Logger
 }
 
 func New(debounce time.Duration, source provider.Provider, status notifier.Status, statePath string, logger *slog.Logger) (*Coordinator, error) {
@@ -73,7 +74,12 @@ func (c *Coordinator) Publish(ctx context.Context, snapshot presence.Snapshot) e
 	}
 	next, err := c.status.Post(ctx, text)
 	if err != nil {
-		return fmt.Errorf("post Slack status: %w", err)
+		var throttled *notifier.RateLimitError
+		if errors.As(err, &throttled) {
+			c.retryNotBefore = time.Now().Add(throttled.RetryAfter)
+			return err
+		}
+		return errors.Join(errPostUnconfirmed, err)
 	}
 
 	nextState := persistedState{
@@ -85,8 +91,19 @@ func (c *Coordinator) Publish(ctx context.Context, snapshot presence.Snapshot) e
 		nextState.Stale = append(nextState.Stale, c.known.Current)
 	}
 	if err := c.state.save(nextState); err != nil {
-		rollbackErr := c.status.Delete(ctx, next)
-		return errors.Join(err, wrapRollback(rollbackErr))
+		var syncErr directorySyncError
+		if errors.As(err, &syncErr) {
+			c.known = nextState
+			return errors.Join(errPostCommitted, err)
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if rollbackErr := c.deleteKnown(cleanupCtx, next); rollbackErr != nil {
+			c.known.DestinationID = c.destinationID
+			c.known.Stale = append(c.known.Stale, next)
+			return errors.Join(err, rollbackErr, c.state.save(c.known))
+		}
+		return err
 	}
 	c.known = nextState
 	if err := c.cleanupStale(ctx); err != nil {
@@ -150,6 +167,10 @@ func (c *Coordinator) cleanupStale(ctx context.Context) error {
 
 func (c *Coordinator) deleteKnown(ctx context.Context, ref notifier.MessageRef) error {
 	if err := c.status.Delete(ctx, ref); err != nil && !errors.Is(err, notifier.ErrMessageNotFound) {
+		var throttled *notifier.RateLimitError
+		if errors.As(err, &throttled) {
+			c.retryNotBefore = time.Now().Add(throttled.RetryAfter)
+		}
 		return fmt.Errorf("delete Slack status %s: %w", ref, err)
 	}
 	return nil
@@ -162,46 +183,71 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		}
 		return err
 	}
-	if err := c.PublishCurrent(ctx); err != nil {
+	err := c.PublishCurrent(ctx)
+	var throttled *notifier.RateLimitError
+	if err != nil && !errors.Is(err, errPostCommitted) && !errors.As(err, &throttled) {
 		return fmt.Errorf("publish initial presence status: %w", err)
 	}
 
-	var timer *time.Timer
-	var timerC <-chan time.Time
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
+	retryDelay := time.Second
+	maintenance := err == nil || errors.Is(err, errPostCommitted)
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	var wake <-chan time.Time
+	schedule := func(delay time.Duration) {
+		c.mu.Lock()
+		delay = max(delay, time.Until(c.retryNotBefore))
+		c.mu.Unlock()
+		timer.Reset(delay)
+		wake = timer.C
+	}
+	if err != nil || c.hasPendingCleanup() {
+		schedule(retryDelay)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-c.provider.Changes():
-			if timer == nil {
-				timer = time.NewTimer(c.debounce)
+			maintenance = false
+			retryDelay = time.Second
+			schedule(c.debounce)
+		case <-wake:
+			wake = nil
+			if maintenance {
+				err = c.retryCleanup(ctx)
 			} else {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(c.debounce)
+				err = c.PublishCurrent(ctx)
+				maintenance = err == nil || errors.Is(err, errPostCommitted)
 			}
-			timerC = timer.C
-		case <-timerC:
-			timerC = nil
-			if err := c.PublishCurrent(ctx); err != nil && ctx.Err() == nil {
-				c.logger.Error("failed to publish presence status", "error", err)
+			if err != nil {
+				c.logger.Error("failed to update presence status", "error", err)
+				if errors.Is(err, errPostUnconfirmed) {
+					continue
+				}
+			}
+			if err != nil || c.hasPendingCleanup() {
+				schedule(retryDelay)
+				retryDelay = min(2*retryDelay, time.Minute)
 			}
 		}
 	}
 }
 
-func wrapRollback(err error) error {
-	if err == nil || errors.Is(err, notifier.ErrMessageNotFound) {
-		return nil
-	}
-	return fmt.Errorf("rollback new Slack status: %w", err)
+func (c *Coordinator) hasPendingCleanup() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state.syncPending || len(c.known.Stale) > 0
 }
+
+func (c *Coordinator) retryCleanup(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.state.retrySync(); err != nil {
+		return err
+	}
+	return c.cleanupStale(ctx)
+}
+
+var errPostUnconfirmed = errors.New("post Slack status unconfirmed")
+var errPostCommitted = errors.New("Slack status was posted")

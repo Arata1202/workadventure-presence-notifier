@@ -28,6 +28,7 @@ type Options struct {
 
 type roomWorker struct {
 	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type Provider struct {
@@ -127,6 +128,7 @@ func (p *Provider) reconcileWorkers(ctx context.Context, client pb.RoomManagerCl
 			continue
 		}
 		worker.cancel()
+		<-worker.done
 		delete(p.workers, roomID)
 	}
 
@@ -135,9 +137,12 @@ func (p *Provider) reconcileWorkers(ctx context.Context, client pb.RoomManagerCl
 			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
-		worker := &roomWorker{cancel: cancel}
+		worker := &roomWorker{cancel: cancel, done: make(chan struct{})}
 		p.workers[roomID] = worker
-		go p.runRoom(workerCtx, client, roomID)
+		go func() {
+			defer close(worker.done)
+			p.runRoom(workerCtx, client, roomID)
+		}()
 	}
 }
 
@@ -146,6 +151,7 @@ func (p *Provider) stopWorkers() {
 	defer p.mu.Unlock()
 	for roomID, worker := range p.workers {
 		worker.cancel()
+		<-worker.done
 		delete(p.workers, roomID)
 	}
 }
@@ -210,6 +216,10 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 	defer timer.Stop()
 	ready := false
 	validated := false
+	// adminJoin emits only joins during its synchronous enumeration. The first
+	// leave proves live delivery has begun, even if the room never goes quiet.
+	liveEvents := false
+	var processed, commitAfter uint64
 	pending := make(map[string]userEntry)
 	commit := func() {
 		if ready {
@@ -224,6 +234,18 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 		case <-ctx.Done():
 			return nil
 		case <-timer.C:
+			if liveEvents {
+				if _, err := p.roomUserCount(ctx, client, roomID); err != nil {
+					return err
+				}
+				// Drain the events already received. A moving watermark would
+				// starve a continuously active room.
+				commitAfter = receivedEvents.Load()
+				if processed >= commitAfter {
+					commit()
+				}
+				continue
+			}
 			if len(results) > 0 {
 				validated = false
 				resetTimer(timer, p.options.InitialSyncTimeout)
@@ -255,6 +277,7 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 				}
 				return fmt.Errorf("receive room presence: %w", result.err)
 			}
+			processed++
 			switch event := result.message.GetMessage().(type) {
 			case *pb.ServerToAdminClientMessage_UserJoinedRoom:
 				if ready {
@@ -262,16 +285,23 @@ func (p *Provider) subscribeRoom(ctx context.Context, client pb.RoomManagerClien
 					continue
 				}
 				addPendingUser(pending, event.UserJoinedRoom.GetUuid(), event.UserJoinedRoom.GetName())
-				validated = false
-				resetTimer(timer, p.options.InitialSyncTimeout)
+				if !liveEvents {
+					validated = false
+					resetTimer(timer, p.options.InitialSyncTimeout)
+				}
 			case *pb.ServerToAdminClientMessage_UserLeftRoom:
 				if ready {
 					p.store.removeUser(roomID, event.UserLeftRoom.GetUuid())
 				} else {
 					removePendingUser(pending, event.UserLeftRoom.GetUuid())
-					validated = false
-					resetTimer(timer, p.options.InitialSyncTimeout)
+					if !liveEvents {
+						liveEvents = true
+						resetTimer(timer, p.options.InitialSyncTimeout)
+					}
 				}
+			}
+			if !ready && commitAfter > 0 && processed >= commitAfter {
+				commit()
 			}
 		}
 	}
@@ -289,7 +319,7 @@ func (p *Provider) roomUserCount(ctx context.Context, client pb.RoomManagerClien
 			return int(room.GetNbUsers()), nil
 		}
 	}
-	return 0, nil
+	return 0, errIncompleteRoomSync
 }
 
 func pendingConnectionCount(users map[string]userEntry) int {

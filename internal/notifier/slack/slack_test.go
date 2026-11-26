@@ -198,3 +198,28 @@ func TestPostEntrancePreservesLongUnicodeMessage(t *testing.T) {
 		t.Fatal("escaped entity split across sections")
 	}
 }
+
+func TestRetryAfterBounds(t *testing.T) {
+	for _, value := range []string{"", "invalid", "10000000000"} {
+		if got := retryAfter(value, 100*time.Millisecond); got != 100*time.Millisecond {
+			t.Errorf("retryAfter(%q) = %v", value, got)
+		}
+	}
+}
+
+func TestFinalThrottleIgnoresUnusableBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	c := newTestClient(t, server.URL+"/")
+	c.maxAttempts = 1
+	c.maxRetryWait = 30 * time.Second
+	_, err := c.Post(context.Background(), "test")
+	var limit *notifier.RateLimitError
+	if !errors.As(err, &limit) || limit.RetryAfter != 7*time.Second {
+		t.Fatalf("unexpected throttle: %v", err)
+	}
+}

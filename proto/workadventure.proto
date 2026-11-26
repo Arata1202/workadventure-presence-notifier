@@ -18,6 +18,7 @@ message AdminPusherToBackMessage {
 message UserJoinedRoomMessage {
   string uuid = 1;
   reserved 2;
+  reserved "ipAddress";
   string name = 3;
 }
 
