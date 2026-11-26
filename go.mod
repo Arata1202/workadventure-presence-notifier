@@ -1,6 +1,6 @@
 module github.com/Arata1202/workadventure-presence-notifier
 
-go 1.27.3
+go 1.27.4
 
 require (
 	google.golang.org/grpc v1.84.0
