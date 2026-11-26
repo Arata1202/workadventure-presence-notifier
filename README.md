@@ -177,6 +177,8 @@ must be verified in the target deployment; they are not established by these tes
 
 The minimum supported version is WorkAdventure `v1.33.0`. End-to-end container tests have been completed against WorkAdventure `v1.33.0` and `v1.34.2`. Later releases may work when the required internal RPCs remain compatible, but untested versions are not guaranteed.
 
+The admin stream enumerates existing connections as joins before sending live events. A leave confirms that enumeration has finished. For streams containing only joins, WorkAdventure supplies no end marker or membership list: the notifier uses quiet periods and room counts, so delayed events can temporarily leave the list stale and continuous joins can delay the first status.
+
 The provider uses the `getRooms` and `adminRoom` RPCs. The compatibility protocol includes only the fields required for presence; WorkAdventure IP address fields are discarded while decoding.
 
 ## Failure behavior

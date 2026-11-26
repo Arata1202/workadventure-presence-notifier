@@ -181,12 +181,18 @@ func (c *Client) Post(ctx context.Context, text string) (notifier.MessageRef, er
 		for len(remaining) > 0 {
 			size := min(len(remaining), maxSectionRunes)
 			if size < len(remaining) {
-				prefix := string(remaining[:size])
-				if start := strings.LastIndex(prefix, "&"); start >= 0 && !strings.Contains(prefix[start:], ";") {
-					size = utf8.RuneCountInString(prefix[:start])
-					if size == 0 {
-						size = min(len(remaining), maxSectionRunes)
+				for offset := 1; offset <= 4; offset++ {
+					start := size - offset
+					if remaining[start] != '&' {
+						continue
 					}
+					for _, entity := range []string{"&amp;", "&lt;", "&gt;"} {
+						if offset < len(entity) && strings.HasPrefix(string(remaining[start:min(start+len(entity), len(remaining))]), entity) {
+							size = start
+							break
+						}
+					}
+					break
 				}
 			}
 			payload.Blocks = append(payload.Blocks, block{Type: "section", Text: &textObject{Type: "plain_text", Text: string(remaining[:size])}})
@@ -233,16 +239,40 @@ func (c *Client) call(ctx context.Context, method string, payload any, result *a
 				return fmt.Errorf("call Slack %s: %w", method, ctx.Err())
 			}
 			if retryTransient && attempt < c.maxAttempts {
-				if err := wait(ctx, time.Duration(attempt)*time.Second); err != nil {
+				if err := wait(ctx, min(time.Duration(attempt)*time.Second, c.maxRetryWait)); err != nil {
 					return err
 				}
 				continue
 			}
 			return fmt.Errorf("call Slack %s: request failed", method)
 		}
+		if response.StatusCode == http.StatusTooManyRequests {
+			response.Body.Close()
+			delay := retryAfter(response.Header.Get("Retry-After"), c.maxRetryWait)
+			if attempt == c.maxAttempts {
+				return &notifier.RateLimitError{RetryAfter: delay}
+			}
+			if err := wait(ctx, delay); err != nil {
+				return err
+			}
+			continue
+		}
+		if response.StatusCode >= 500 && retryTransient && attempt < c.maxAttempts {
+			response.Body.Close()
+			if err := wait(ctx, min(time.Duration(attempt)*time.Second, c.maxRetryWait)); err != nil {
+				return err
+			}
+			continue
+		}
 		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseSize+1))
 		response.Body.Close()
 		if readErr != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("read Slack %s response: %w", method, ctx.Err())
+			}
+			if errors.Is(readErr, context.DeadlineExceeded) {
+				return fmt.Errorf("read Slack %s response: %w", method, context.DeadlineExceeded)
+			}
 			return fmt.Errorf("read Slack %s response", method)
 		}
 		if len(responseBody) > maxResponseSize {
@@ -250,19 +280,6 @@ func (c *Client) call(ctx context.Context, method string, payload any, result *a
 		}
 		*result = apiResponse{}
 		decodeErr := json.Unmarshal(responseBody, result)
-		if response.StatusCode == http.StatusTooManyRequests && attempt < c.maxAttempts {
-			delay := retryAfter(response.Header.Get("Retry-After"), c.maxRetryWait)
-			if err := wait(ctx, delay); err != nil {
-				return err
-			}
-			continue
-		}
-		if response.StatusCode >= 500 && retryTransient && attempt < c.maxAttempts {
-			if err := wait(ctx, time.Duration(attempt)*time.Second); err != nil {
-				return err
-			}
-			continue
-		}
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			return fmt.Errorf("Slack %s returned HTTP %d", method, response.StatusCode)
 		}
@@ -283,13 +300,12 @@ func (c *Client) call(ctx context.Context, method string, payload any, result *a
 func retryAfter(value string, maximum time.Duration) time.Duration {
 	seconds, err := strconv.Atoi(value)
 	if err != nil || seconds < 1 {
-		return time.Second
+		return min(time.Second, maximum)
 	}
-	delay := time.Duration(seconds) * time.Second
-	if delay > maximum {
+	if time.Duration(seconds) > maximum/time.Second {
 		return maximum
 	}
-	return delay
+	return time.Duration(seconds) * time.Second
 }
 
 func safeErrorCode(code string) string {

@@ -1,5 +1,6 @@
 .git
 .gitignore
 config.yaml
+**/.env
 bin
 workadventure-presence-notifier

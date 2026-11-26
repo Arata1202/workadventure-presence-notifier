@@ -156,3 +156,11 @@ func TestStoreRetainsGlobalSnapshotWhileExistingRoomReconnects(t *testing.T) {
 		t.Fatalf("snapshot after reconnect = %#v, %v", snapshot, err)
 	}
 }
+
+func TestStoreComparesCompleteUserFields(t *testing.T) {
+	s := newStore()
+	s.setRooms([]string{"room"})
+	s.replaceRoom("room", map[string]userEntry{"a": {name: "x\x00b\x00y", count: 1}})
+	s.replaceRoom("room", map[string]userEntry{"a": {name: "x", count: 1}, "b": {name: "y", count: 1}})
+	assertChange(t, s.changes())
+}

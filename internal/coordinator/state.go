@@ -23,7 +23,10 @@ func (state persistedState) empty() bool {
 	return state.Current == "" && len(state.Stale) == 0
 }
 
-type stateFile struct{ path string }
+type stateFile struct {
+	path        string
+	syncPending bool
+}
 
 func (s *stateFile) load() (persistedState, error) {
 	data, err := os.ReadFile(s.path)
@@ -45,10 +48,12 @@ func (s *stateFile) load() (persistedState, error) {
 
 func (s *stateFile) save(state persistedState) error {
 	if state.empty() {
-		if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(s.path); errors.Is(err, os.ErrNotExist) {
+			return s.retrySync()
+		} else if err != nil {
 			return fmt.Errorf("remove status state: %w", err)
 		}
-		return nil
+		return s.syncDirectory()
 	}
 	if err := validateState(state); err != nil {
 		return fmt.Errorf("write status state: %w", err)
@@ -87,6 +92,29 @@ func (s *stateFile) save(state persistedState) error {
 		return fmt.Errorf("replace status state: %w", err)
 	}
 	removeTemporary = false
+	return s.syncDirectory()
+}
+
+// The rename or removal is visible even if its durability cannot be confirmed.
+type directorySyncError struct{ error }
+
+func (s *stateFile) retrySync() error {
+	if !s.syncPending {
+		return nil
+	}
+	return s.syncDirectory()
+}
+
+func (s *stateFile) syncDirectory() error {
+	dir, err := os.Open(filepath.Dir(s.path))
+	if err == nil {
+		defer dir.Close()
+		err = dir.Sync()
+	}
+	s.syncPending = err != nil
+	if err != nil {
+		return directorySyncError{fmt.Errorf("sync status state directory: %w", err)}
+	}
 	return nil
 }
 
@@ -117,7 +145,7 @@ func validateState(state persistedState) error {
 }
 
 func validMessageTS(value string) bool {
-	if value == "" || len(value) > 64 || !strings.Contains(value, ".") {
+	if value == "" || len(value) > 64 || strings.Count(value, ".") != 1 || value[0] == '.' || value[len(value)-1] == '.' {
 		return false
 	}
 	for _, character := range value {

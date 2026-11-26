@@ -33,10 +33,11 @@ The release workflow will:
 
 1. Run the full CI workflow.
 2. Build Linux AMD64 and ARM64 images.
-3. Publish version, major/minor, major, and `latest` tags to `ghcr.io/arata1202/workadventure-presence-notifier`.
+3. Publish the exact version tag to `ghcr.io/arata1202/workadventure-presence-notifier`.
 4. Attach an SBOM and GitHub artifact provenance.
 5. Verify that the image is anonymously accessible and contains both target platforms.
-6. Create a GitHub Release with generated release notes.
+6. Promote the major/minor, major, and `latest` tags when this version is the newest published version in their respective ranges.
+7. Create a GitHub Release with generated release notes.
 
 ## First GHCR publication
 

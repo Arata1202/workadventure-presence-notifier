@@ -131,7 +131,7 @@ func startInteractions(address, secret string) (*http.Server, <-chan error, <-ch
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		return nil, nil, nil, errors.New("start Slack interaction receiver: cannot bind destination.slack.interactions_listen")
+		return nil, nil, nil, fmt.Errorf("start Slack interaction receiver: cannot bind destination.slack.interactions_listen: %s", listenerFailureReason(err))
 	}
 	server := &http.Server{
 		Addr: listener.Addr().String(), Handler: handler, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 2 * time.Second,
@@ -142,8 +142,20 @@ func startInteractions(address, secret string) (*http.Server, <-chan error, <-ch
 	go func() {
 		defer close(done)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			failures <- errors.New("Slack interaction receiver stopped unexpectedly")
+			failures <- fmt.Errorf("Slack interaction receiver stopped unexpectedly: %s", listenerFailureReason(err))
 		}
 	}()
 	return server, failures, done, nil
+}
+
+func listenerFailureReason(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno.Error()
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "address lookup failed"
+	}
+	return "listener I/O error"
 }

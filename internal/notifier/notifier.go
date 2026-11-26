@@ -3,6 +3,7 @@ package notifier
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/Arata1202/workadventure-presence-notifier/internal/presence"
 )
@@ -10,6 +11,11 @@ import (
 type MessageRef string
 
 var ErrMessageNotFound = errors.New("destination message not found")
+
+// RateLimitError means the server rejected the request before applying it.
+type RateLimitError struct{ RetryAfter time.Duration }
+
+func (*RateLimitError) Error() string { return "Slack returned HTTP 429" }
 
 // Status maintains one presence status in an external destination.
 type Status interface {

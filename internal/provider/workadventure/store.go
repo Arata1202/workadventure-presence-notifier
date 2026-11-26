@@ -2,8 +2,8 @@ package workadventure
 
 import (
 	"errors"
+	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +28,6 @@ type store struct {
 	discovered   bool
 	readyCh      chan struct{}
 	changeCh     chan struct{}
-	lastState    string
 	lastSnapshot presence.Snapshot
 	initialized  bool
 }
@@ -176,36 +175,20 @@ func (s *store) publishChangeLocked() {
 		return
 	}
 	snapshot := s.snapshotLocked()
-	state := fingerprint(snapshot)
 	if !s.initialized {
 		s.initialized = true
-		s.lastState = state
 		s.lastSnapshot = snapshot
 		close(s.readyCh)
 		return
 	}
-	if state == s.lastState {
+	if slices.Equal(snapshot.Users, s.lastSnapshot.Users) {
 		return
 	}
-	s.lastState = state
 	s.lastSnapshot = snapshot
 	select {
 	case s.changeCh <- struct{}{}:
 	default:
 	}
-}
-
-func fingerprint(snapshot presence.Snapshot) string {
-	users := append([]presence.User(nil), snapshot.Users...)
-	sort.Slice(users, func(i, j int) bool { return users[i].ID < users[j].ID })
-	var state strings.Builder
-	for _, user := range users {
-		state.WriteString(user.ID)
-		state.WriteByte(0)
-		state.WriteString(user.Name)
-		state.WriteByte(0)
-	}
-	return state.String()
 }
 
 func preferredName(existing, candidate string) string {

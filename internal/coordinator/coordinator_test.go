@@ -28,12 +28,13 @@ func (p *fakeProvider) Snapshot() (presence.Snapshot, error) { return p.snapshot
 func (p *fakeProvider) Changes() <-chan struct{}             { return p.changes }
 
 type fakeStatus struct {
-	destinationID string
-	mu            sync.Mutex
-	nextRef       notifier.MessageRef
-	actions       []string
-	deleteErr     map[notifier.MessageRef]error
-	onDelete      func(notifier.MessageRef)
+	destinationID        string
+	mu                   sync.Mutex
+	nextRef              notifier.MessageRef
+	actions              []string
+	deleteErr            map[notifier.MessageRef]error
+	inspectDeleteContext func(context.Context)
+	onDelete             func(notifier.MessageRef)
 }
 
 func (s *fakeStatus) DestinationID() string {
@@ -49,8 +50,11 @@ func (s *fakeStatus) Post(context.Context, string) (notifier.MessageRef, error) 
 	s.actions = append(s.actions, "post:"+string(s.nextRef))
 	return s.nextRef, nil
 }
-func (s *fakeStatus) Delete(_ context.Context, ref notifier.MessageRef) error {
+func (s *fakeStatus) Delete(ctx context.Context, ref notifier.MessageRef) error {
 	s.mu.Lock()
+	if s.inspectDeleteContext != nil {
+		s.inspectDeleteContext(ctx)
+	}
 	s.actions = append(s.actions, "delete:"+string(ref))
 	err := s.deleteErr[ref]
 	onDelete := s.onDelete
@@ -299,4 +303,49 @@ func onlineSnapshot() presence.Snapshot {
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestTimestampRequiresTwoDecimalParts(t *testing.T) {
+	for _, ts := range []string{".", ".1", "1.", "1.2.3"} {
+		if validMessageTS(ts) {
+			t.Errorf("accepted %q", ts)
+		}
+	}
+}
+
+func TestFailedRollbackRetainsReferenceForClear(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "state")
+	ref := notifier.MessageRef("111.222")
+	status := &fakeStatus{nextRef: ref, deleteErr: map[notifier.MessageRef]error{ref: errors.New("temporary failure")}}
+	c, err := New(0, &fakeProvider{}, status, filepath.Join(directory, "state.json"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(directory, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	status.inspectDeleteContext = func(ctx context.Context) {
+		if _, bounded := ctx.Deadline(); ctx.Err() != nil || !bounded {
+			t.Error("rollback must have its own active deadline")
+		}
+	}
+	if err := c.Publish(ctx, onlineSnapshot()); err == nil {
+		t.Fatal("expected save failure")
+	}
+	if !reflect.DeepEqual(c.known.Stale, []notifier.MessageRef{ref}) {
+		t.Fatal(c.known)
+	}
+	status.inspectDeleteContext = nil
+	delete(status.deleteErr, ref)
+	if err := os.Remove(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Clear(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(status.actionsSnapshot(), []string{"post:111.222", "delete:111.222", "delete:111.222"}) {
+		t.Fatal(status.actionsSnapshot())
+	}
 }

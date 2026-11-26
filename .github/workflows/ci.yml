@@ -13,6 +13,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,7 +25,9 @@ jobs:
           cache: true
 
       - name: Format check
-        run: test -z "$(gofmt -l .)"
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then echo "$files"; exit 1; fi
 
       - name: Vet
         run: go vet ./...
@@ -39,4 +42,6 @@ jobs:
         run: docker build --build-arg VERSION=ci -t workadventure-presence-notifier:ci .
 
       - name: Verify container version
-        run: test "$(docker run --rm workadventure-presence-notifier:ci --version)" = "ci"
+        run: |
+          version=$(docker run --rm workadventure-presence-notifier:ci --version)
+          test "$version" = ci
